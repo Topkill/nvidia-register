@@ -5,6 +5,7 @@ config.toml
 # 输出文件
 accounts.csv
 nvidia_api_key.txt
+captcha_artifacts/
 
 # Python
 __pycache__/

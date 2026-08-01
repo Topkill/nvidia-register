@@ -231,14 +231,17 @@ async def _register_one(
 # ---------------------------------------------------------------------------
 
 async def _accept_cookie_banner(page: Page) -> None:
-    """OneTrust cookie 弹窗会用遮罩拦截点击，必须先接受。"""
+    """Cookie consent overlays block the sign-in button until dismissed."""
     try:
-        btn = page.locator("#onetrust-accept-btn-handler")
-        await btn.wait_for(state="visible", timeout=8000)
-        await btn.click()
+        button = page.locator("#onetrust-accept-btn-handler")
+        await button.wait_for(state="visible", timeout=30000)
+        await button.click()
         print("  cookie accepted")
-        await page.locator("div.onetrust-pc-dark-filter").wait_for(state="hidden", timeout=5000)
-    except Exception:
+        await page.locator("#onetrust-banner-sdk").wait_for(
+            state="hidden",
+            timeout=10000,
+        )
+    except PlaywrightTimeoutError:
         pass
     await asyncio.sleep(1)
 
@@ -248,11 +251,11 @@ async def _open_signin_modal(page: Page) -> bool:
     实测：点 Login 后先出现临时弹窗，1~2 秒后页面自动刷新出真正有效弹窗。
     """
     try:
-        login = page.get_by_role("button", name="Login").first
+        login = page.get_by_role("button", name="Login").filter(visible=True).first
         await login.wait_for(state="visible", timeout=10000)
         await login.click()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"  Login click failed: {exc}")
 
     # 等待邮箱输入框首次出现（第一个临时弹窗）
     try:

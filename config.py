@@ -33,6 +33,16 @@ class CaptchaConfig:
     yescaptcha_api_url: str
     captcharun_token: str | None
     captcharun_api_url: str
+    llm_model: str | None
+    llm_api_base: str
+    llm_api_key: str | None
+    llm_reasoning_effort: str | None
+    llm_call_delay_seconds: int
+    llm_action_delay_seconds: int
+    llm_calls_per_attempt: int
+    llm_max_attempts: int
+    llm_max_output_tokens: int
+    llm_artifact_dir: Path | None
     poll_interval_seconds: int
     timeout_seconds: int
 
@@ -123,11 +133,21 @@ domain = "duckmail.sbs"
 api_key = ""
 
 [captcha]
-mode = "manual" # manual | yescaptcha | captcharun
+mode = "manual" # manual | yescaptcha | captcharun | llm
 yescaptcha_client_key = ""
 yescaptcha_api_url = "https://api.yescaptcha.com"
 captcharun_token = ""
 captcharun_api_url = "https://api.captcha-run.com"
+llm_model = ""
+llm_api_base = "https://api.openai.com/v1"
+llm_api_key = ""
+llm_reasoning_effort = "auto" # auto | none | minimal | low | medium | high | xhigh | max
+llm_call_delay_seconds = 5
+llm_action_delay_seconds = 5
+llm_calls_per_attempt = 10
+llm_max_attempts = 2
+llm_max_output_tokens = 1200
+llm_artifact_dir = "" # optional; saves screenshots and trace.jsonl
 poll_interval_seconds = 3
 timeout_seconds = 180
 
@@ -186,14 +206,58 @@ def load_config() -> AppConfig:
     duckmail_api_key = _get_str(data, "duckmail.api_key", "") or None
 
     captcha_mode = _get_str(data, "captcha.mode", "manual").lower()
-    if captcha_mode not in {"manual", "yescaptcha", "captcharun"}:
-        raise ValueError("captcha.mode must be 'manual', 'yescaptcha' or 'captcharun'")
+    if captcha_mode not in {"manual", "yescaptcha", "captcharun", "llm"}:
+        raise ValueError(
+            "captcha.mode must be 'manual', 'yescaptcha', 'captcharun', or 'llm'"
+        )
     yescaptcha_client_key = _get_str(data, "captcha.yescaptcha_client_key", "") or None
     if captcha_mode == "yescaptcha" and not yescaptcha_client_key:
         raise ValueError("captcha.yescaptcha_client_key is required when captcha.mode = 'yescaptcha'")
     captcharun_token = _get_str(data, "captcha.captcharun_token", "") or None
     if captcha_mode == "captcharun" and not captcharun_token:
         raise ValueError("captcha.captcharun_token is required when captcha.mode = 'captcharun'")
+    llm_model = _get_str(data, "captcha.llm_model", "") or None
+    llm_api_base = _get_str(
+        data, "captcha.llm_api_base", "https://api.openai.com/v1"
+    ).rstrip("/")
+    llm_api_key = _get_str(data, "captcha.llm_api_key", "") or None
+    llm_reasoning_effort_value = _get_str(
+        data, "captcha.llm_reasoning_effort", "auto"
+    ).lower()
+    supported_reasoning_efforts = {
+        "auto",
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    }
+    if llm_reasoning_effort_value not in supported_reasoning_efforts:
+        raise ValueError(
+            "captcha.llm_reasoning_effort must be auto, none, minimal, low, medium, high, xhigh, or max"
+        )
+    if captcha_mode == "llm" and (not llm_model or not llm_api_key):
+        raise ValueError(
+            "captcha.llm_model and captcha.llm_api_key are required when captcha.mode = 'llm'"
+        )
+    llm_call_delay_seconds = _get_int(data, "captcha.llm_call_delay_seconds", 5)
+    llm_action_delay_seconds = _get_int(data, "captcha.llm_action_delay_seconds", 5)
+    llm_calls_per_attempt = _get_int(data, "captcha.llm_calls_per_attempt", 10)
+    llm_max_attempts = _get_int(data, "captcha.llm_max_attempts", 2)
+    llm_max_output_tokens = _get_int(data, "captcha.llm_max_output_tokens", 1200)
+    llm_artifact_dir_value = _get_str(data, "captcha.llm_artifact_dir", "")
+    if not 0 <= llm_call_delay_seconds <= 300:
+        raise ValueError("captcha.llm_call_delay_seconds must be between 0 and 300")
+    if not 0 <= llm_action_delay_seconds <= 300:
+        raise ValueError("captcha.llm_action_delay_seconds must be between 0 and 300")
+    if not 1 <= llm_calls_per_attempt <= 50:
+        raise ValueError("captcha.llm_calls_per_attempt must be between 1 and 50")
+    if not 1 <= llm_max_attempts <= 10:
+        raise ValueError("captcha.llm_max_attempts must be between 1 and 10")
+    if not 128 <= llm_max_output_tokens <= 32768:
+        raise ValueError("captcha.llm_max_output_tokens must be between 128 and 32768")
 
     return AppConfig(
         email_provider=email_provider,
@@ -214,6 +278,22 @@ def load_config() -> AppConfig:
             yescaptcha_api_url=_get_str(data, "captcha.yescaptcha_api_url", "https://api.yescaptcha.com").rstrip("/"),
             captcharun_token=captcharun_token,
             captcharun_api_url=_get_str(data, "captcha.captcharun_api_url", "https://api.captcha-run.com").rstrip("/"),
+            llm_model=llm_model,
+            llm_api_base=llm_api_base,
+            llm_api_key=llm_api_key,
+            llm_reasoning_effort=(
+                None if llm_reasoning_effort_value == "auto" else llm_reasoning_effort_value
+            ),
+            llm_call_delay_seconds=llm_call_delay_seconds,
+            llm_action_delay_seconds=llm_action_delay_seconds,
+            llm_calls_per_attempt=llm_calls_per_attempt,
+            llm_max_attempts=llm_max_attempts,
+            llm_max_output_tokens=llm_max_output_tokens,
+            llm_artifact_dir=(
+                _resolve_path(llm_artifact_dir_value)
+                if llm_artifact_dir_value
+                else None
+            ),
             poll_interval_seconds=_get_int(data, "captcha.poll_interval_seconds", 3),
             timeout_seconds=_get_int(data, "captcha.timeout_seconds", 180),
         ),
