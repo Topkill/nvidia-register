@@ -55,6 +55,7 @@ email_provider = "cloudflare_temp_email"
 [cloudflare_temp_email]
 api_url = "https://mail.your-server.com"
 admin_auth = "your_admin_key"
+custom_auth = ""
 domain = "your-domain.com"
 
 [duckmail]
@@ -87,6 +88,7 @@ close_delay_seconds = 5
 | `email_provider` | 临时邮箱服务类型（支持 `cloudflare_temp_email` / `duckmail`） |
 | `cloudflare_temp_email.api_url` | 邮箱服务 API 地址 |
 | `cloudflare_temp_email.admin_auth` | 邮箱服务管理员密钥 |
+| `cloudflare_temp_email.custom_auth` | 站点访问密码（网站启用私人访问密码时需填写，对应 `x-custom-auth`） |
 | `cloudflare_temp_email.domain` | 邮箱域名 |
 | `duckmail.api_url` | DuckMail API 地址（默认 `https://api.duckmail.sbs`） |
 | `duckmail.domain` | DuckMail 邮箱域名，例如 `duckmail.sbs` 或你的私有域名 |
@@ -140,7 +142,13 @@ build.nvidia.com (填邮箱) → login.nvgs.nvidia.com (填密码 + hCaptcha)
 ```python
 class TempEmailProvider(Protocol):
     def create_inbox(self, name: str) -> TempEmailInbox: ...
-    def poll_verification_code(self, inbox: TempEmailInbox, timeout_seconds: int = 180) -> str | None: ...
+    def snapshot_message_ids(self, inbox: TempEmailInbox) -> set[str]: ...
+    def poll_verification_code(
+        self,
+        inbox: TempEmailInbox,
+        timeout_seconds: int = 180,
+        known_message_ids: set[str] | None = None,
+    ) -> str | None: ...
 ```
 
 在 `email_providers.py` 中添加新 Provider 并注册到 `build_email_provider()` 即可。

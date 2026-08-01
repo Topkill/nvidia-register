@@ -3,6 +3,7 @@ email_provider = "cloudflare_temp_email" # cloudflare_temp_email | duckmail
 [cloudflare_temp_email]
 api_url = ""
 admin_auth = ""
+custom_auth = ""
 domain = ""
 
 [duckmail]

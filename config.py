@@ -16,6 +16,7 @@ class CloudflareTempEmailConfig:
     api_url: str
     admin_auth: str
     domain: str
+    custom_auth: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,7 @@ email_provider = "cloudflare_temp_email"
 [cloudflare_temp_email]
 api_url = ""
 admin_auth = ""
+custom_auth = ""
 domain = ""
 
 [duckmail]
@@ -174,6 +176,7 @@ def load_config() -> AppConfig:
         if use_cloudflare_temp_email
         else _get_str(data, "cloudflare_temp_email.domain", "")
     )
+    cloudflare_custom_auth = _get_str(data, "cloudflare_temp_email.custom_auth", "")
 
     duckmail_domain = (
         _require_str(data, "duckmail.domain")
@@ -198,6 +201,7 @@ def load_config() -> AppConfig:
             api_url=cloudflare_api_url,
             admin_auth=cloudflare_admin_auth,
             domain=cloudflare_domain,
+            custom_auth=cloudflare_custom_auth,
         ),
         duckmail=DuckMailConfig(
             api_url=_get_str(data, "duckmail.api_url", "https://api.duckmail.sbs").rstrip("/"),

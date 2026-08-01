@@ -58,6 +58,13 @@ def _parse_count(argv: list[str]) -> int | None:
     return None
 
 def main_cli() -> None:
+    # 非 TTY（重定向/后台/IDE）下 Python 默认块缓冲，输出会被憋住；
+    # 设为行缓冲保证每个 print 实时可见
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+
     args = sys.argv[1:]
 
     if args and args[0] == "--init":
@@ -353,6 +360,20 @@ async def register_account(
             if await register_btn.is_enabled():
                 break
             await asyncio.sleep(1)
+    except Exception as exc:
+        print(f"  #register_button not ready: {exc}")
+        await _print_clickable_snapshot(page)
+        return False
+
+    # 点击前记录已有邮件，避免把上一封验证码当成这次注册的结果。
+    try:
+        known_message_ids = email_provider.snapshot_message_ids(inbox)
+    except Exception as exc:
+        print(f"  mailbox snapshot failed: {exc}")
+        return False
+    print(f"  Mailbox baseline: {len(known_message_ids)} existing message(s)")
+
+    try:
         await register_btn.click()
     except Exception as exc:
         print(f"  #register_button not clickable: {exc}")
@@ -361,7 +382,11 @@ async def register_account(
 
     # [3/4] 等待验证码邮件
     print("\n[3/4] Waiting for verification code email...")
-    code = email_provider.poll_verification_code(inbox, timeout_seconds=config.captcha.timeout_seconds)
+    code = email_provider.poll_verification_code(
+        inbox,
+        timeout_seconds=config.captcha.timeout_seconds,
+        known_message_ids=known_message_ids,
+    )
     if not code:
         print("  No verification code received")
         return False
