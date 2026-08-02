@@ -137,7 +137,7 @@ domain = "duckmail.sbs"
 api_key = ""
 
 [captcha]
-mode = "llm" # manual | yescaptcha | captcharun | llm
+mode = "manual" # manual | yescaptcha | captcharun | llm
 yescaptcha_client_key = ""
 yescaptcha_api_url = "https://api.yescaptcha.com"
 captcharun_token = ""

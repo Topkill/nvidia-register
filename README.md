@@ -146,15 +146,29 @@ close_delay_seconds = 5
 | `browser.launch_stagger_seconds` | 相邻浏览器会话启动的最小间隔（0-300 秒，默认 8） |
 | `browser.close_delay_seconds` | 完成后浏览器关闭延迟秒数 |
 
-### 当前 LLM 配置
+### 建议的首次使用流程
 
-本分支按本地 `config.toml` 使用 **`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`**，通过
-`https://your-llm-provider.example/v1` 的 Responses API 完成截图识别和结构化动作输出。这里的“自给自足”指
-本项目新增了独立的 LLM 识图验证码路径，不再强制依赖 YesCaptcha 或 CaptchaRun；接口密钥仍由使用者
-自行提供，且只保存在被 `.gitignore` 忽略的 `config.toml` 中。
+公开仓库不包含任何内部 API 地址或密钥。建议先使用手动验证码完成 3 个你自己拥有、且符合服务
+条款的账号：
 
-如果更换服务，必须同时确认模型支持视觉输入、严格 JSON Schema，以及配置的 API 协议；仅支持文本
-对话的模型不能用于 `llm` 模式。
+```toml
+[captcha]
+mode = "manual"
+
+[browser]
+headless = false
+```
+
+```bash
+python main.py --headed -n 3
+```
+
+完成后，妥善保管本地生成的 `accounts.csv`，再按照你自己的 sub2api 部署文档，把这 3 个账号导入
+到私有实例中。账号密码和 API Key 都属于敏感信息，不要提交到 GitHub；Sub2API 后续如何配置模型
+路由、配额和并发，应以它的官方文档和你的服务授权范围为准。
+
+如果启用本项目的 LLM 验证码模式，必须在本地 `config.toml` 填写你自己的兼容 API 地址、密钥和模型。
+公开示例只使用占位地址，不代表任何真实服务。
 
 ## 使用
 
@@ -166,7 +180,10 @@ python main.py
 python main.py -n 5
 python main.py --count 3
 
-# 无头浏览器 + LLM 视觉识图（覆盖 browser.headless 配置）
+# 首次建议有头浏览器 + 手动完成验证码，注册 3 个自有账号
+python main.py --headed -n 3
+
+# 已配置兼容视觉模型后，才启用无头 LLM 识图
 python main.py --headless -n 1
 
 # 同时运行 3 个相互隔离的无头会话，共注册 10 个账号
@@ -206,8 +223,10 @@ nv12345678@your-domain.com,aB3dE5fG7hI9,nvapi-xxxx...
 `input_image` 和 JSON Schema。canvas 无法导出时才退回 iframe/视口截图。其他验证码模式仍可
 通过原有选项选择。
 
-本分支实际使用的模型就是 **`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`**。模型选择不是
-硬编码限制，配置兼容的视觉模型即可替换。
+本分支当前配置使用的模型名是 **`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`**；公开仓库
+不会记录实际 API 地址。模型选择不是硬编码限制，配置兼容的视觉模型即可替换。这里的“自给自足”
+指新增独立的 LLM 识图验证码路径，不强制依赖 YesCaptcha 或 CaptchaRun，但仍需要你自行提供有权
+使用的模型服务。
 
 LLM 模式可在无头 Chromium 中运行，推荐使用 `python main.py --headless -n 1`。浏览器截图、
 canvas 导出和鼠标坐标映射都由 Playwright 页面对象完成，不依赖桌面显示服务。
