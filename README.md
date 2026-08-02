@@ -2,11 +2,15 @@
 
 自动注册 NVIDIA BUILD 账号并创建 api key
 
+> 这是基于上游 [zseek/nvidia-register](https://github.com/zseek/nvidia-register) 的非官方魔改版。
+> 我们保留上游的注册、临时邮箱和 API Key 流程，并加入了独立、无需第三方验证码平台的视觉
+> LLM 方案。感谢上游作者维护原始项目；如果你只需要原版流程，建议直接使用并支持上游项目。
+
 ## 功能特点
 
 - **全自动流程**：创建临时邮箱 → 注册 → 过验证码 → 创建组织 → 建 Key → 记录 CSV，全流程自动化
 - **批量注册**：支持单次注册多个账号，交互式询问或 `-n` 参数直接指定
-- **验证码**：支持手动模式（`manual`）以及 YesCaptcha（`yescaptcha`）、CaptchaRun（`captcharun`）、视觉模型（`llm`）三种自动模式
+- **验证码**：支持手动模式（`manual`）、YesCaptcha（`yescaptcha`）、CaptchaRun（`captcharun`）和视觉模型（`llm`）
 - **邮箱服务**：支持 `cloudflare_temp_email`（自部署）和 `duckmail`（DuckMail API）
 - **随机密码**：每次注册自动生成 12 位密码（大小写 + 数字）
 - **自动跳过手机验证**：利用组织名注册跳过手机号要求，并创建长效 API Key
@@ -32,11 +36,17 @@
 - Chromium 浏览器（Playwright 自动下载）
 - **临时邮箱服务**（当前支持 `cloudflare_temp_email` 自部署 和 `duckmail`）
 - （可选）[YesCaptcha](https://yescaptcha.com/i/57yzUt) / [CaptchaRun](https://captcha-run.com/sso?inviter=ad8fbc2f-9721-430e-87a9-1898fa0177b4) 密钥（用于对应的自动模式）
-- （可选）支持图像输入和 JSON Schema 输出的 Responses API 模型与 API Key（用于 `llm` 模式）
+- （推荐）当前配置中的视觉模型 `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` 与对应 API Key
+- （可选）其他支持图像输入和 JSON Schema 输出的 Responses API 或 Chat Completions 服务
 
 ## 安装
 
 ```bash
+# 推荐：使用 uv 安装运行时和开发依赖
+uv sync
+uv run playwright install chromium
+
+# 或使用 pip
 pip install -r requirements.txt
 playwright install chromium
 ```
@@ -65,24 +75,25 @@ domain = "duckmail.sbs"
 api_key = ""
 
 [captcha]
-mode = "manual" # manual | yescaptcha | captcharun | llm
+mode = "llm" # manual | yescaptcha | captcharun | llm
 yescaptcha_client_key = ""
 yescaptcha_api_url = "https://api.yescaptcha.com"
 captcharun_token = ""
 captcharun_api_url = "https://api.captcha-run.com"
-llm_model = ""
-llm_api_base = "https://api.openai.com/v1"
-llm_api_key = ""
-llm_reasoning_effort = "auto" # auto | none | minimal | low | medium | high | xhigh | max
+llm_model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+llm_api_protocol = "responses" # responses | chat_completions
+llm_api_base = "https://your-llm-provider.example/v1"
+llm_api_key = "your_llm_api_key"
+llm_reasoning_effort = "none" # auto | none | minimal | low | medium | high | xhigh | max
 llm_call_delay_seconds = 1
 llm_action_delay_seconds = 1
 llm_calls_per_attempt = 8
 llm_max_attempts = 2
 llm_max_output_tokens = 1200
 llm_max_concurrency = 1
-llm_artifact_dir = "" # optional; keeps bounded failure screenshots and trace.jsonl
+llm_artifact_dir = "failure_artifacts/llm" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
-timeout_seconds = 180
+timeout_seconds = 240
 
 [nvidia]
 output_csv = "accounts.csv"
@@ -113,8 +124,9 @@ close_delay_seconds = 5
 | `captcha.captcharun_token` | CaptchaRun Authorization Token（mode=captcharun 时必填） |
 | `captcha.captcharun_api_url` | CaptchaRun API 地址（默认 `https://api.captcha-run.com`） |
 | `captcha.llm_model` | 支持视觉输入的模型名称（mode=llm 时必填） |
-| `captcha.llm_api_base` | Responses API Base 或完整 `/responses` 地址 |
-| `captcha.llm_api_key` | Responses API Key（mode=llm 时必填） |
+| `captcha.llm_api_protocol` | LLM 协议：`responses`（当前配置）或 `chat_completions`（其他兼容服务） |
+| `captcha.llm_api_base` | 对应协议的 API Base；程序会自动补全 `/chat/completions` 或 `/responses` |
+| `captcha.llm_api_key` | LLM API Key（mode=llm 时必填）；密钥只放在本地 `config.toml`，不要提交 |
 | `captcha.llm_reasoning_effort` | 推理强度；`auto` 表示不发送 `reasoning` 参数 |
 | `captcha.llm_call_delay_seconds` | 截图和相邻模型调用前的页面等待时间（秒） |
 | `captcha.llm_action_delay_seconds` | 执行动作后、截取新画面前的等待时间（秒） |
@@ -133,6 +145,16 @@ close_delay_seconds = 5
 | `browser.concurrency` | 隔离浏览器会话的最大并发数（1-10，默认 1） |
 | `browser.launch_stagger_seconds` | 相邻浏览器会话启动的最小间隔（0-300 秒，默认 8） |
 | `browser.close_delay_seconds` | 完成后浏览器关闭延迟秒数 |
+
+### 当前 LLM 配置
+
+本分支按本地 `config.toml` 使用 **`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`**，通过
+`https://your-llm-provider.example/v1` 的 Responses API 完成截图识别和结构化动作输出。这里的“自给自足”指
+本项目新增了独立的 LLM 识图验证码路径，不再强制依赖 YesCaptcha 或 CaptchaRun；接口密钥仍由使用者
+自行提供，且只保存在被 `.gitignore` 忽略的 `config.toml` 中。
+
+如果更换服务，必须同时确认模型支持视觉输入、严格 JSON Schema，以及配置的 API 协议；仅支持文本
+对话的模型不能用于 `llm` 模式。
 
 ## 使用
 
@@ -178,9 +200,14 @@ nv12345678@your-domain.com,aB3dE5fG7hI9,nvapi-xxxx...
 
 ## LLM 验证码模式
 
-将 `captcha.mode` 显式设置为 `llm` 后，程序优先从 hCaptcha canvas 导出原生分辨率 PNG，
-同时从 DOM 读取挑战题目，再发送到 Responses API。canvas 无法导出时才退回 iframe/视口
-截图。其他验证码模式仍可通过原有选项选择。
+将 `captcha.mode` 设置为 `llm` 后，程序优先从 hCaptcha canvas 导出原生分辨率 PNG，
+同时从 DOM 读取挑战题目，再发送到配置的 LLM API。`chat_completions` 模式使用
+`/chat/completions` 的视觉输入和 JSON Schema；`responses` 模式使用 `/responses` 的
+`input_image` 和 JSON Schema。canvas 无法导出时才退回 iframe/视口截图。其他验证码模式仍可
+通过原有选项选择。
+
+本分支实际使用的模型就是 **`nvidia/nemotron-3-nano-omni-30b-a3b-reasoning`**。模型选择不是
+硬编码限制，配置兼容的视觉模型即可替换。
 
 LLM 模式可在无头 Chromium 中运行，推荐使用 `python main.py --headless -n 1`。浏览器截图、
 canvas 导出和鼠标坐标映射都由 Playwright 页面对象完成，不依赖桌面显示服务。
@@ -220,8 +247,8 @@ hCaptcha。普通题每次模型调用最多执行一个点击或拖动；3×3 �
 `status` 支持 `actions`、`verify` 和 `solved`（解析器仍兼容旧的 `failed` 响应）。坐标固定
 使用 0-1000 归一化空间；3×3 DOM 网格还必须给出从 1 开始的 `grid_row/grid_column`，控制器
 优先按行列落到格子中心，其他任务将这两个字段设为 `null`。原生 canvas 坐标会按它的 CSS
-显示比例映射回页面，超出截图范围的动作会被拒绝。API 需要兼容 Responses 的 `input_image`
-和严格 JSON Schema 输出。
+显示比例映射回页面，超出截图范围的动作会被拒绝。配置的 API 必须支持对应协议的图片输入和
+严格 JSON Schema 输出。
 第三方兼容接口即使返回 Markdown 包裹的 JSON 也会尝试提取；若配置了
 `llm_artifact_dir`，其中会记录原始响应、canvas/CSS 缩放、局部坐标和最终页面坐标。相同截图
 只写一次，每个失败会话最多保留 16 张常规截图，并仅保留最近 20 个失败/超时会话；成功会话
@@ -261,3 +288,9 @@ class TempEmailProvider(Protocol):
 - 浏览器窗口会在完成后自动关闭（可配置延迟）
 - 批量注册时每个账号独立浏览器会话，互不影响
 - 第二次 `Ctrl+C` 强制退出
+
+## 测试
+
+```bash
+uv run pytest -q
+```

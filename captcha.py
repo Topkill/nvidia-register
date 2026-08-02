@@ -194,6 +194,7 @@ class LLMCaptchaSolver:
     calls_per_attempt: int = LLM_CALLS_PER_ATTEMPT
     max_attempts: int = LLM_MAX_ATTEMPTS
     max_output_tokens: int = 1200
+    api_protocol: str = "responses"
     artifact_dir: Path | None = None
     request_semaphore: asyncio.Semaphore | None = None
     last_error: str | None = None
@@ -1291,47 +1292,80 @@ class LLMCaptchaSolver:
         if allow_multiple_actions:
             max_actions = LLM_MAX_MULTI_ACTIONS_PER_CALL
             action_schema["properties"]["actions"]["maxItems"] = max_actions
-        request_payload: dict[str, Any] = {
-            "model": self.model,
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": _llm_captcha_prompt(
-                                width,
-                                height,
-                                attempt,
-                                call_number,
-                                challenge_prompt,
-                                submit_label,
-                                capture_source,
-                                executed_action_count,
-                                feedback,
-                                allow_multiple_actions,
-                            ),
-                        },
-                        {
-                            "type": "input_image",
-                            "image_url": f"data:image/png;base64,{image_data}",
-                            "detail": "high",
-                        },
-                    ],
-                }
-            ],
-            "text": {
-                "format": {
+        prompt = _llm_captcha_prompt(
+            width,
+            height,
+            attempt,
+            call_number,
+            challenge_prompt,
+            submit_label,
+            capture_source,
+            executed_action_count,
+            feedback,
+            allow_multiple_actions,
+        )
+        if self.api_protocol == "chat_completions":
+            request_payload = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{image_data}",
+                                    "detail": "high",
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "response_format": {
                     "type": "json_schema",
-                    "name": "captcha_actions",
-                    "strict": True,
-                    "schema": action_schema,
-                }
-            },
-            "max_output_tokens": self.max_output_tokens,
-        }
-        if self.reasoning_effort:
-            request_payload["reasoning"] = {"effort": self.reasoning_effort}
+                    "json_schema": {
+                        "name": "captcha_actions",
+                        "strict": True,
+                        "schema": action_schema,
+                    },
+                },
+                "max_tokens": self.max_output_tokens,
+            }
+            if self.reasoning_effort:
+                request_payload["reasoning_effort"] = self.reasoning_effort
+            endpoint = _chat_completions_endpoint(self.api_base)
+            api_name = "Chat Completions API"
+        else:
+            request_payload = {
+                "model": self.model,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": prompt},
+                            {
+                                "type": "input_image",
+                                "image_url": f"data:image/png;base64,{image_data}",
+                                "detail": "high",
+                            },
+                        ],
+                    }
+                ],
+                "text": {
+                    "format": {
+                        "type": "json_schema",
+                        "name": "captcha_actions",
+                        "strict": True,
+                        "schema": action_schema,
+                    }
+                },
+                "max_output_tokens": self.max_output_tokens,
+            }
+            if self.reasoning_effort:
+                request_payload["reasoning"] = {"effort": self.reasoning_effort}
+            endpoint = _responses_endpoint(self.api_base)
+            api_name = "Responses API"
         request_budget = min(
             float(LLM_REQUEST_MAX_SECONDS),
             max(
@@ -1348,11 +1382,11 @@ class LLMCaptchaSolver:
             remaining = request_deadline - time.monotonic()
             if remaining <= 0:
                 raise RuntimeError(
-                    last_request_error or "Responses API request deadline reached"
+                    last_request_error or f"{api_name} request deadline reached"
                 )
             try:
                 response = requests.post(
-                    _responses_endpoint(self.api_base),
+                    endpoint,
                     headers={
                         "Authorization": f"Bearer {self.api_key}",
                         "Content-Type": "application/json",
@@ -1361,14 +1395,14 @@ class LLMCaptchaSolver:
                     timeout=max(0.1, remaining),
                 )
             except requests.RequestException as exc:
-                last_request_error = f"Responses API network error: {exc}"
+                last_request_error = f"{api_name} network error: {exc}"
                 response = None
             else:
                 if response.ok:
                     break
                 detail = response.text[:300].replace("\n", " ")
                 last_request_error = (
-                    f"Responses API HTTP {response.status_code}: {detail}"
+                    f"{api_name} HTTP {response.status_code}: {detail}"
                 )
                 if response.status_code not in LLM_TRANSIENT_HTTP_STATUSES:
                     raise RuntimeError(last_request_error)
@@ -1395,12 +1429,18 @@ class LLMCaptchaSolver:
                 time.sleep(retry_delay)
 
         if response is None or not response.ok:
-            raise RuntimeError(last_request_error or "Responses API request failed")
+            raise RuntimeError(last_request_error or f"{api_name} request failed")
         try:
             payload = response.json()
         except ValueError as exc:
-            raise RuntimeError("Responses API returned invalid JSON") from exc
-        output_text = _responses_output_text(payload)
+            raise RuntimeError(f"{api_name} returned invalid JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"{api_name} returned a non-object JSON payload")
+        output_text = (
+            _chat_completion_output_text(payload)
+            if self.api_protocol == "chat_completions"
+            else _responses_output_text(payload)
+        )
         try:
             decision = _parse_llm_decision(
                 output_text,
@@ -2723,6 +2763,15 @@ def _responses_endpoint(api_base: str) -> str:
     return normalized if normalized.endswith("/responses") else f"{normalized}/responses"
 
 
+def _chat_completions_endpoint(api_base: str) -> str:
+    normalized = api_base.rstrip("/")
+    return (
+        normalized
+        if normalized.endswith("/chat/completions")
+        else f"{normalized}/chat/completions"
+    )
+
+
 def _is_actionable_submit_label(label: str) -> bool:
     normalized = " ".join(label.lower().split())
     if not normalized or "skip" in normalized or "跳过" in normalized:
@@ -3085,6 +3134,38 @@ def _responses_output_text(payload: dict[str, Any]) -> str:
     if error:
         raise RuntimeError(f"Responses API error: {str(error)[:300]}")
     raise RuntimeError("Responses API response contained no output text")
+
+
+def _chat_completion_output_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0]
+        if isinstance(choice, dict):
+            message = choice.get("message")
+            if isinstance(message, dict):
+                refusal = message.get("refusal")
+                if isinstance(refusal, str) and refusal.strip():
+                    raise RuntimeError(
+                        f"Chat Completions API refused the image request: {refusal[:200]}"
+                    )
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+                if isinstance(content, list):
+                    chunks = [
+                        str(part["text"]).strip()
+                        for part in content
+                        if isinstance(part, dict)
+                        and isinstance(part.get("text"), str)
+                        and part["text"].strip()
+                    ]
+                    if chunks:
+                        return "\n".join(chunks)
+
+    error = payload.get("error")
+    if error:
+        raise RuntimeError(f"Chat Completions API error: {str(error)[:300]}")
+    raise RuntimeError("Chat Completions API response contained no output text")
 
 
 def _parse_llm_decision(
@@ -3506,6 +3587,7 @@ def build_captcha_solver(
             model=config.llm_model,
             api_base=config.llm_api_base,
             api_key=config.llm_api_key,
+            api_protocol=config.llm_api_protocol,
             timeout_seconds=config.timeout_seconds,
             reasoning_effort=config.llm_reasoning_effort,
             call_delay_seconds=config.llm_call_delay_seconds,

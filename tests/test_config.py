@@ -36,6 +36,7 @@ class CaptchaConfigTests(unittest.TestCase):
         self.assertEqual(config.captcha.mode, "manual")
         self.assertIsNone(config.captcha.llm_model)
         self.assertIsNone(config.captcha.llm_api_key)
+        self.assertEqual(config.captcha.llm_api_protocol, "responses")
         self.assertEqual(config.captcha.llm_api_base, "https://api.openai.com/v1")
         self.assertEqual(config.captcha.llm_calls_per_attempt, 8)
         self.assertEqual(config.captcha.llm_max_attempts, 2)
@@ -51,6 +52,7 @@ mode = "llm"
 llm_model = "vision-model"
 llm_api_base = "https://api.example.test/v1/"
 llm_api_key = "secret"
+llm_api_protocol = "chat_completions"
 llm_reasoning_effort = "high"
 llm_call_delay_seconds = 1
 llm_action_delay_seconds = 2
@@ -65,6 +67,7 @@ llm_artifact_dir = "debug/captcha"
         self.assertEqual(config.captcha.llm_model, "vision-model")
         self.assertEqual(config.captcha.llm_api_base, "https://api.example.test/v1")
         self.assertEqual(config.captcha.llm_api_key, "secret")
+        self.assertEqual(config.captcha.llm_api_protocol, "chat_completions")
         self.assertEqual(config.captcha.llm_reasoning_effort, "high")
         self.assertEqual(config.captcha.llm_call_delay_seconds, 1)
         self.assertEqual(config.captcha.llm_action_delay_seconds, 2)
@@ -76,6 +79,12 @@ llm_artifact_dir = "debug/captcha"
     def test_llm_mode_requires_model_and_api_key(self) -> None:
         with self.assertRaisesRegex(ValueError, "llm_model.*llm_api_key"):
             self._load('mode = "llm"')
+
+    def test_rejects_unknown_llm_api_protocol(self) -> None:
+        with self.assertRaisesRegex(ValueError, "llm_api_protocol"):
+            self._load(
+                'mode = "manual"\nllm_api_protocol = "legacy"'
+            )
 
     def test_rejects_llm_execution_parameters_outside_limits(self) -> None:
         with self.assertRaisesRegex(ValueError, "llm_calls_per_attempt"):

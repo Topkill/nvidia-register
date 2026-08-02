@@ -1,10 +1,19 @@
 [project]
 name = "nvidia-register"
 version = "0.1.0"
-description = "Add your description here"
+description = "NVIDIA account registration helper with vision-model captcha support"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "playwright>=1.40.0",
     "requests>=2.28.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

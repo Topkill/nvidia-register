@@ -48,6 +48,7 @@ from captcha import (
     _parse_pattern_grounding,
     _parse_verbose_click_decision,
     _refresh_llm_capture_geometry,
+    _chat_completions_endpoint,
     _responses_endpoint,
     build_captcha_solver,
     reset_captcha_state,
@@ -116,6 +117,7 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
             llm_model="vision-model",
             llm_api_base="https://llm.example.test/v1",
             llm_api_key="llm-key",
+            llm_api_protocol="responses",
             llm_reasoning_effort=None,
             llm_call_delay_seconds=5,
             llm_action_delay_seconds=5,
@@ -624,6 +626,18 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
             "https://api.example.test/v1/responses",
         )
 
+    def test_chat_completions_endpoint_accepts_base_or_full_url(self) -> None:
+        self.assertEqual(
+            _chat_completions_endpoint("http://127.0.0.1:11434/v1"),
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+        self.assertEqual(
+            _chat_completions_endpoint(
+                "http://127.0.0.1:11434/v1/chat/completions"
+            ),
+            "http://127.0.0.1:11434/v1/chat/completions",
+        )
+
     def test_request_uses_image_and_strict_json_schema(self) -> None:
         response = Mock(ok=True, status_code=200)
         response.json.return_value = {
@@ -710,6 +724,58 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(schema["properties"]["actions"]["maxItems"], 9)
         self.assertEqual(decision.actions[0].start_x, 79.04)
         self.assertEqual(decision.actions[0].start_y, 198.97)
+
+    def test_chat_completions_request_uses_vision_and_json_schema(self) -> None:
+        response = Mock(ok=True, status_code=200)
+        response.json.return_value = {
+            "id": "chatcmpl-1",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": (
+                            '{"status":"solved","actions":[],"message":"done",'
+                            '"coordinate_space":"normalized_1000"}'
+                        ),
+                    }
+                }
+            ],
+        }
+        solver = LLMCaptchaSolver(
+            "vision-model",
+            "https://chat.example.test/v1",
+            "api-key",
+            30,
+            reasoning_effort="high",
+            max_output_tokens=2048,
+            api_protocol="chat_completions",
+        )
+
+        with patch("captcha.requests.post", return_value=response) as post:
+            decision = solver._request_decision(b"png", 1280, 800, 1, 1)
+
+        self.assertEqual(decision.status, "solved")
+        self.assertEqual(decision.response_id, "chatcmpl-1")
+        request = post.call_args
+        self.assertEqual(
+            request.args[0],
+            "https://chat.example.test/v1/chat/completions",
+        )
+        body = request.kwargs["json"]
+        self.assertEqual(body["model"], "vision-model")
+        self.assertEqual(body["reasoning_effort"], "high")
+        self.assertEqual(body["max_tokens"], 2048)
+        self.assertTrue(body["response_format"]["json_schema"]["strict"])
+        self.assertEqual(
+            body["response_format"]["json_schema"]["schema"]["properties"]
+            ["actions"]["maxItems"],
+            1,
+        )
+        self.assertTrue(
+            body["messages"][0]["content"][1]["image_url"]["url"].startswith(
+                "data:image/png;base64,"
+            )
+        )
 
     def test_request_retries_one_transient_network_failure(self) -> None:
         response = Mock(ok=True, status_code=200)

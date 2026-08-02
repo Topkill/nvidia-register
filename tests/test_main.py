@@ -176,6 +176,7 @@ def _app_config(captcha_mode: str, concurrency: int = 1) -> AppConfig:
         llm_model="vision-model" if captcha_mode == "llm" else None,
         llm_api_base="https://example.test/v1",
         llm_api_key="secret" if captcha_mode == "llm" else None,
+        llm_api_protocol="responses",
         llm_reasoning_effort=None,
         llm_call_delay_seconds=0,
         llm_action_delay_seconds=0,

@@ -36,6 +36,7 @@ class CaptchaConfig:
     llm_model: str | None
     llm_api_base: str
     llm_api_key: str | None
+    llm_api_protocol: str
     llm_reasoning_effort: str | None
     llm_call_delay_seconds: int
     llm_action_delay_seconds: int
@@ -136,24 +137,25 @@ domain = "duckmail.sbs"
 api_key = ""
 
 [captcha]
-mode = "manual" # manual | yescaptcha | captcharun | llm
+mode = "llm" # manual | yescaptcha | captcharun | llm
 yescaptcha_client_key = ""
 yescaptcha_api_url = "https://api.yescaptcha.com"
 captcharun_token = ""
 captcharun_api_url = "https://api.captcha-run.com"
-llm_model = ""
-llm_api_base = "https://api.openai.com/v1"
+llm_model = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+llm_api_protocol = "responses" # responses | chat_completions
+llm_api_base = "https://your-llm-provider.example/v1"
 llm_api_key = ""
-llm_reasoning_effort = "auto" # auto | none | minimal | low | medium | high | xhigh | max
+llm_reasoning_effort = "none" # auto | none | minimal | low | medium | high | xhigh | max
 llm_call_delay_seconds = 1
 llm_action_delay_seconds = 1
 llm_calls_per_attempt = 8
 llm_max_attempts = 2
 llm_max_output_tokens = 1200
 llm_max_concurrency = 1
-llm_artifact_dir = "" # optional; keeps bounded failure screenshots and trace.jsonl
+llm_artifact_dir = "failure_artifacts/llm" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
-timeout_seconds = 180
+timeout_seconds = 240
 
 [nvidia]
 output_csv = "accounts.csv"
@@ -227,6 +229,13 @@ def load_config() -> AppConfig:
         data, "captcha.llm_api_base", "https://api.openai.com/v1"
     ).rstrip("/")
     llm_api_key = _get_str(data, "captcha.llm_api_key", "") or None
+    llm_api_protocol = _get_str(
+        data, "captcha.llm_api_protocol", "responses"
+    ).lower()
+    if llm_api_protocol not in {"responses", "chat_completions"}:
+        raise ValueError(
+            "captcha.llm_api_protocol must be responses or chat_completions"
+        )
     llm_reasoning_effort_value = _get_str(
         data, "captcha.llm_reasoning_effort", "auto"
     ).lower()
@@ -297,6 +306,7 @@ def load_config() -> AppConfig:
             llm_model=llm_model,
             llm_api_base=llm_api_base,
             llm_api_key=llm_api_key,
+            llm_api_protocol=llm_api_protocol,
             llm_reasoning_effort=(
                 None if llm_reasoning_effort_value == "auto" else llm_reasoning_effort_value
             ),
