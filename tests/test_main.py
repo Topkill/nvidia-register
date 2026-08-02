@@ -1,0 +1,207 @@
+from __future__ import annotations
+
+import asyncio
+import unittest
+from pathlib import Path
+from unittest.mock import AsyncMock, Mock, patch
+
+from config import (
+    AppConfig,
+    BrowserConfig,
+    CaptchaConfig,
+    CloudflareTempEmailConfig,
+    DuckMailConfig,
+    NvidiaConfig,
+)
+from main import (
+    _chromium_user_agent,
+    _login_ngc,
+    _parse_cli_options,
+    _redact_artifact_url,
+    _run_accounts,
+    _wait_for_verification_submission,
+    run,
+)
+
+
+class CliOptionsTests(unittest.TestCase):
+    def test_parses_count_and_headless_override(self) -> None:
+        self.assertEqual(
+            _parse_cli_options(["main.py", "--headless", "-n", "3"]),
+            (3, True, None),
+        )
+
+    def test_last_browser_mode_flag_wins(self) -> None:
+        self.assertEqual(
+            _parse_cli_options(["main.py", "--headless", "--headed"]),
+            (None, False, None),
+        )
+
+    def test_parses_concurrency_override(self) -> None:
+        self.assertEqual(
+            _parse_cli_options(["main.py", "-n", "10", "-j", "3"]),
+            (10, None, 3),
+        )
+
+    def test_headless_user_agent_uses_browser_version_without_marker(self) -> None:
+        user_agent = _chromium_user_agent("138.0.7204.23")
+
+        self.assertIn("Chrome/138.0.7204.23", user_agent)
+        self.assertNotIn("HeadlessChrome", user_agent)
+
+    def test_failure_artifact_url_drops_sensitive_query_and_fragment(self) -> None:
+        redacted = _redact_artifact_url(
+            "https://login.example.test/v1/create-account?email=user@example.test&key=secret#step"
+        )
+
+        self.assertEqual(redacted, "https://login.example.test/v1/create-account")
+
+
+class HeadlessModeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_manual_captcha_before_starting_browser(self) -> None:
+        config = _app_config("manual")
+
+        with self.assertRaisesRegex(ValueError, "automatic captcha mode"):
+            await run(config, 1)
+
+    async def test_accepts_llm_mode_validation(self) -> None:
+        config = _app_config("llm")
+        # A zero count avoids external I/O while exercising the startup validation path.
+        await run(config, 0)
+
+
+class VerificationSubmissionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_explicit_invalid_code_message(self) -> None:
+        body = Mock()
+        body.inner_text = AsyncMock(return_value="验证码无效。请重新请求验证码。")
+        page = Mock(url="https://login.example.test/v1/profile-complete")
+        page.locator.return_value = body
+
+        accepted = await _wait_for_verification_submission(page, page.url, 1)
+
+        self.assertFalse(accepted)
+
+    async def test_accepts_when_verification_inputs_disappear(self) -> None:
+        body = Mock()
+        body.inner_text = AsyncMock(return_value="Processing")
+        inputs = Mock()
+        inputs.count = AsyncMock(return_value=0)
+        page = Mock(url="https://login.example.test/v1/profile-complete")
+        page.locator.side_effect = lambda selector: body if selector == "body" else inputs
+
+        accepted = await _wait_for_verification_submission(page, page.url, 1)
+
+        self.assertTrue(accepted)
+
+    async def test_ngc_login_advances_email_then_password(self) -> None:
+        original_url = "https://ngc.nvidia.com/signin"
+        page = Mock(url=original_url)
+
+        password = Mock()
+        password.count = AsyncMock(side_effect=[0, 1, 0])
+        password.is_visible = AsyncMock(return_value=True)
+        password.fill = AsyncMock()
+        password.first = password
+
+        email = Mock()
+        email.count = AsyncMock(side_effect=[1, 0])
+        email.is_visible = AsyncMock(return_value=True)
+        email.fill = AsyncMock()
+        email.first = email
+
+        continue_button = Mock()
+        continue_button.count = AsyncMock(return_value=1)
+        continue_button.is_visible = AsyncMock(return_value=True)
+        continue_button.is_enabled = AsyncMock(return_value=True)
+        continue_button.click = AsyncMock()
+        continue_button.first = continue_button
+
+        login_button = Mock()
+        login_button.count = AsyncMock(return_value=1)
+        login_button.is_visible = AsyncMock(return_value=True)
+        login_button.is_enabled = AsyncMock(return_value=True)
+
+        async def finish_login(**_kwargs) -> None:
+            page.url = "https://ngc.nvidia.com/"
+
+        login_button.click = AsyncMock(side_effect=finish_login)
+        login_button.first = login_button
+
+        page.locator.side_effect = (
+            lambda selector: password if 'type="password"' in selector else email
+        )
+        page.get_by_role.side_effect = lambda _role, name: (
+            login_button if name == "Log In" else continue_button
+        )
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            logged_in = await _login_ngc(page, "user@example.test", "secret")
+
+        self.assertTrue(logged_in)
+        email.fill.assert_awaited_once_with("user@example.test")
+        password.fill.assert_awaited_once_with("secret")
+
+
+class ParallelSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_pool_limits_concurrency_and_runs_every_account(self) -> None:
+        config = _app_config("llm", concurrency=2)
+        active = 0
+        maximum_active = 0
+        account_indices: list[int] = []
+
+        async def fake_register(*_args, account_index: int, **_kwargs):
+            nonlocal active, maximum_active
+            active += 1
+            maximum_active = max(maximum_active, active)
+            account_indices.append(account_index)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return f"key-{account_index}"
+
+        with patch("main._register_one", side_effect=fake_register):
+            results = await _run_accounts(object(), config, 5)
+
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual(sorted(account_indices), [0, 1, 2, 3, 4])
+        self.assertEqual(sorted(results), [f"key-{index}" for index in range(5)])
+
+
+def _app_config(captcha_mode: str, concurrency: int = 1) -> AppConfig:
+    captcha = CaptchaConfig(
+        mode=captcha_mode,
+        yescaptcha_client_key=None,
+        yescaptcha_api_url="https://example.test",
+        captcharun_token=None,
+        captcharun_api_url="https://example.test",
+        llm_model="vision-model" if captcha_mode == "llm" else None,
+        llm_api_base="https://example.test/v1",
+        llm_api_key="secret" if captcha_mode == "llm" else None,
+        llm_reasoning_effort=None,
+        llm_call_delay_seconds=0,
+        llm_action_delay_seconds=0,
+        llm_calls_per_attempt=1,
+        llm_max_attempts=1,
+        llm_max_output_tokens=128,
+        llm_max_concurrency=1,
+        llm_artifact_dir=None,
+        poll_interval_seconds=1,
+        timeout_seconds=1,
+    )
+    return AppConfig(
+        email_provider="duckmail",
+        cloudflare_temp_email=CloudflareTempEmailConfig("", "", ""),
+        duckmail=DuckMailConfig("https://example.test", "example.test", None),
+        captcha=captcha,
+        nvidia=NvidiaConfig(
+            output_csv=Path("accounts.csv"),
+            key_name="api",
+            account_name="NVIDIA Build",
+            key_expiry_date="2126-05-08T08:00:00Z",
+        ),
+        browser=BrowserConfig(
+            headless=True,
+            concurrency=concurrency,
+            launch_stagger_seconds=0,
+            close_delay_seconds=0,
+        ),
+    )

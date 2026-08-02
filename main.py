@@ -26,6 +26,10 @@ import json
 import signal
 import sys
 import time
+from dataclasses import replace
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from playwright.async_api import (
     Page,
@@ -39,23 +43,44 @@ from email_providers import TempEmailProvider, build_email_provider
 from passwords import generate_password
 from records import append_account_record
 
+
+FAILURE_ARTIFACT_DIR = Path(__file__).resolve().parent / "failure_artifacts"
+ACCOUNT_ATTEMPTS = 2
+
 # ---------------------------------------------------------------------------
 #  CLI
 # ---------------------------------------------------------------------------
 
-def _parse_count(argv: list[str]) -> int | None:
-    """从命令行参数解析 -n / --count 的值。"""
+def _parse_cli_options(argv: list[str]) -> tuple[int | None, bool | None, int | None]:
+    """解析注册数量、浏览器显示模式和并发数覆盖项。"""
     args = argv[1:]
+    count: int | None = None
+    headless: bool | None = None
+    concurrency: int | None = None
     i = 0
     while i < len(args):
         if args[i] in ("-n", "--count") and i + 1 < len(args):
             try:
-                return int(args[i + 1])
+                count = int(args[i + 1])
             except ValueError:
                 print(f"Error: {args[i]} requires a number, got: {args[i + 1]}")
                 sys.exit(1)
+            i += 2
+            continue
+        if args[i] in ("-j", "--concurrency") and i + 1 < len(args):
+            try:
+                concurrency = int(args[i + 1])
+            except ValueError:
+                print(f"Error: {args[i]} requires a number, got: {args[i + 1]}")
+                sys.exit(1)
+            i += 2
+            continue
+        if args[i] == "--headless":
+            headless = True
+        elif args[i] == "--headed":
+            headless = False
         i += 1
-    return None
+    return count, headless, concurrency
 
 def main_cli() -> None:
     # 非 TTY（重定向/后台/IDE）下 Python 默认块缓冲，输出会被憋住；
@@ -73,7 +98,24 @@ def main_cli() -> None:
 
     config = load_config()
 
-    count = _parse_count(sys.argv)
+    count, headless_override, concurrency_override = _parse_cli_options(sys.argv)
+    if headless_override is not None or concurrency_override is not None:
+        config = replace(
+            config,
+            browser=replace(
+                config.browser,
+                headless=(
+                    headless_override
+                    if headless_override is not None
+                    else config.browser.headless
+                ),
+                concurrency=(
+                    concurrency_override
+                    if concurrency_override is not None
+                    else config.browser.concurrency
+                ),
+            ),
+        )
     if count is None:
         # 交互式询问
         try:
@@ -107,8 +149,16 @@ def _handle_sigint():
     print("\n\nCtrl+C received. Will exit after current account finishes...")
 
 async def run(config: AppConfig, count: int = 1) -> None:
-    email_provider = build_email_provider(config)
-    captcha_solver = build_captcha_solver(config.captcha)
+    global _shutdown
+    _shutdown = False
+    if config.browser.headless and config.captcha.mode == "manual":
+        raise ValueError(
+            "Headless browser mode requires an automatic captcha mode "
+            "(llm, yescaptcha, or captcharun); manual mode cannot display the challenge"
+        )
+
+    if not 1 <= config.browser.concurrency <= 10:
+        raise ValueError("Browser concurrency must be between 1 and 10")
 
     print("=" * 60)
     print("NVIDIA Register + API Key Creator")
@@ -126,65 +176,130 @@ async def run(config: AppConfig, count: int = 1) -> None:
         # Windows 不支持 add_signal_handler，用 signal.signal 兜底
         signal.signal(signal.SIGINT, lambda *_: _handle_sigint())
 
-    success_count = 0
-    fail_count = 0
-
     async with async_playwright() as p:
-        for i in range(count):
-            if _shutdown:
-                break
+        results = await _run_accounts(p, config, count)
 
-            print(f"\n{'#' * 60}")
-            print(f"# 账号 {i + 1} / {count}")
-            print(f"{'#' * 60}")
-
-            api_key = await _register_one(p, config, email_provider, captcha_solver)
-            if api_key:
-                success_count += 1
-            else:
-                fail_count += 1
-
-            # 非最后一个账号时，间隔一下避免频率限制
-            if i < count - 1 and not _shutdown:
-                print("\n  等待 5 秒后注册下一个...")
-                await asyncio.sleep(5)
+    success_count = sum(result is not None for result in results)
+    fail_count = len(results) - success_count
 
     # 汇总
     print("\n" + "=" * 60)
     print(f"完成! 成功: {success_count}, 失败: {fail_count}, 总计: {success_count + fail_count}")
     print("=" * 60)
 
+
+async def _run_accounts(p, config: AppConfig, count: int) -> list[str | None]:
+    """Run isolated account sessions with a bounded worker pool."""
+    next_index = 0
+    index_lock = asyncio.Lock()
+    record_lock = asyncio.Lock()
+    launch_lock = asyncio.Lock()
+    last_launch_at = 0.0
+    llm_request_semaphore = asyncio.Semaphore(config.captcha.llm_max_concurrency)
+    results: list[str | None] = []
+
+    async def wait_for_launch_slot() -> None:
+        nonlocal last_launch_at
+        async with launch_lock:
+            delay = config.browser.launch_stagger_seconds - (
+                time.monotonic() - last_launch_at
+            )
+            if last_launch_at and delay > 0:
+                await asyncio.sleep(delay)
+            last_launch_at = time.monotonic()
+
+    async def worker() -> None:
+        nonlocal next_index
+        while True:
+            async with index_lock:
+                if _shutdown or next_index >= count:
+                    return
+                account_index = next_index
+                next_index += 1
+
+            print(f"\n{'#' * 60}")
+            print(f"# 账号 {account_index + 1} / {count}")
+            print(f"{'#' * 60}")
+            try:
+                result = None
+                for account_attempt in range(1, ACCOUNT_ATTEMPTS + 1):
+                    await wait_for_launch_slot()
+                    result = await _register_one(
+                        p,
+                        config,
+                        account_index=account_index,
+                        record_lock=record_lock,
+                        llm_request_semaphore=llm_request_semaphore,
+                    )
+                    if result is not None or account_attempt >= ACCOUNT_ATTEMPTS:
+                        break
+                    print(
+                        f"  Account {account_index + 1} retrying after failed attempt "
+                        f"({account_attempt}/{ACCOUNT_ATTEMPTS})..."
+                    )
+                    await asyncio.sleep(2)
+            except Exception as exc:
+                print(f"\n  Account {account_index + 1} failed unexpectedly: {exc}")
+                result = None
+            results.append(result)
+
+    worker_count = min(count, config.browser.concurrency)
+    await asyncio.gather(*(worker() for _ in range(worker_count)))
+    return results
+
 async def _register_one(
     p,
     config: AppConfig,
-    email_provider: TempEmailProvider,
-    captcha_solver,
+    account_index: int,
+    record_lock: asyncio.Lock,
+    llm_request_semaphore: asyncio.Semaphore,
 ) -> str | None:
     """单个账号的完整注册流程。返回 api_key 或 None。"""
+    email_provider = build_email_provider(config)
+    captcha_solver = build_captcha_solver(
+        config.captcha,
+        request_semaphore=llm_request_semaphore,
+    )
     password = generate_password(12)
-    reset_captcha_state()  # 重置 sitekey 缓存，确保每个账号独立
     browser = await p.chromium.launch(
+        channel="chromium" if config.browser.headless else None,
         headless=config.browser.headless,
         args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
     )
-    page = await browser.new_page(viewport={"width": 1280, "height": 800})
+    try:
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                _chromium_user_agent(browser.version)
+                if config.browser.headless
+                else None
+            ),
+        )
+        page = await context.new_page()
+        reset_captcha_state(page)
+    except Exception:
+        await browser.close()
+        raise
 
+    stage = "email_creation"
     try:
         # 1. 创建临时邮箱
-        inbox_name = "nv" + str(int(time.time()))[-8:]
+        inbox_name = f"nv{time.time_ns() % 10**12:012d}{account_index:02d}"
         try:
-            inbox = email_provider.create_inbox(inbox_name)
+            inbox = await asyncio.to_thread(email_provider.create_inbox, inbox_name)
         except Exception as exc:
             print(f"  Email creation failed: {exc}")
             return None
         print(f"\n[1] Email: {inbox.address}")
 
         # 2. 打开 build.nvidia.com，接受 cookie 弹窗
+        stage = "build_entry"
         print("[2] Opening build.nvidia.com...")
         await page.goto("https://build.nvidia.com/", wait_until="domcontentloaded", timeout=90000)
-        await _accept_cookie_banner(page)
+        await _accept_cookie_banner(page, timeout_seconds=10)
 
         # 3. 点击 Login 打开登录弹窗
+        stage = "sign_in_modal"
         print("[3] Open sign-in modal...")
         if not await _open_signin_modal(page):
             print("  Login button not found")
@@ -192,6 +307,7 @@ async def _register_one(
             return None
 
         # 4. 填邮箱 → Next（跳转到 login.nvgs.nvidia.com/v1/create-account）
+        stage = "email_submission"
         print("[4] Submit email...")
         start_capturing_sitekey(page)
         await _ensure_hcaptcha_hook(page)
@@ -201,76 +317,216 @@ async def _register_one(
             return None
 
         # 5. 注册（填密码 → 过 hCaptcha → 提交 → 验证码）
+        stage = "registration"
         ok = await register_account(page, inbox, password, email_provider, captcha_solver, config)
         if not ok:
             print("\nRegistration failed")
             return None
 
         # 6. 状态机处理注册后跳转，直到 session 有效并建 key
+        stage = "api_key_creation"
         api_key = await finalize_and_create_key(page, inbox, password, config)
 
         # 7. 记录到 CSV
         if api_key:
-            append_account_record(
-                path=config.nvidia.output_csv,
-                email=inbox.address,
-                password=password,
-                api_key=api_key,
-            )
+            stage = "recording"
+            async with record_lock:
+                await asyncio.to_thread(
+                    append_account_record,
+                    path=config.nvidia.output_csv,
+                    email=inbox.address,
+                    password=password,
+                    api_key=api_key,
+                )
             print(f"  Record saved to: {config.nvidia.output_csv}")
             print(f"\n  ✓ {inbox.address} → {api_key[:30]}...")
+            stage = "completed"
             return api_key
         else:
             print("\nRegistration succeeded but API Key creation failed")
             return None
     finally:
+        if stage != "completed":
+            await _save_failure_artifact(
+                page,
+                account_index=account_index,
+                stage=stage,
+                detail=getattr(captcha_solver, "last_error", None),
+            )
         await _close_browser(browser, config.browser.close_delay_seconds)
+
+
+def _chromium_user_agent(version: str) -> str:
+    """Return the regular Linux Chrome UA for Playwright's full headless Chromium."""
+    return (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{version} Safari/537.36"
+    )
+
+
+def _redact_artifact_url(url: str) -> str:
+    """Keep page identity without persisting emails or signed query values."""
+    parsed = urlsplit(url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+async def _save_failure_artifact(
+    page: Page,
+    account_index: int,
+    stage: str,
+    detail: str | None,
+) -> None:
+    session_dir = FAILURE_ARTIFACT_DIR / (
+        f"{time.strftime('%Y%m%d-%H%M%S')}-account-{account_index + 1:02d}-"
+        f"{uuid4().hex[:8]}"
+    )
+    try:
+        session_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+        screenshot = session_dir / "page.png"
+        await page.screenshot(path=str(screenshot), type="png", timeout=5000)
+        screenshot.chmod(0o600)
+        metadata = session_dir / "metadata.json"
+        metadata.write_text(
+            json.dumps(
+                {
+                    "account_index": account_index + 1,
+                    "stage": stage,
+                    "url": _redact_artifact_url(page.url),
+                    "detail": detail,
+                    "time": time.time(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        metadata.chmod(0o600)
+        print(f"  Failure artifact saved: {session_dir}")
+    except Exception as exc:
+        print(f"  Failure artifact could not be saved: {exc}")
 
 # ---------------------------------------------------------------------------
 #  子流程
 # ---------------------------------------------------------------------------
 
-async def _accept_cookie_banner(page: Page) -> None:
-    """Cookie consent overlays block the sign-in button until dismissed."""
-    try:
-        button = page.locator("#onetrust-accept-btn-handler")
-        await button.wait_for(state="visible", timeout=30000)
-        await button.click()
-        print("  cookie accepted")
-        await page.locator("#onetrust-banner-sdk").wait_for(
-            state="hidden",
-            timeout=10000,
+async def _accept_cookie_banner(page: Page, timeout_seconds: float = 3) -> None:
+    """Dismiss a late-loading OneTrust overlay without blocking page startup."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        selectors = (
+            "#onetrust-accept-btn-handler:visible",
+            "#onetrust-reject-all-handler:visible",
+            "#onetrust-consent-sdk button:visible",
+            "button:visible",
         )
-    except PlaywrightTimeoutError:
-        pass
-    await asyncio.sleep(1)
+        for selector in selectors:
+            buttons = page.locator(selector)
+            try:
+                count = await buttons.count()
+            except Exception:
+                continue
+            for index in range(min(count, 12)):
+                button = buttons.nth(index)
+                try:
+                    label = " ".join(
+                        (
+                            await button.inner_text(timeout=300)
+                        ).split()
+                    ).lower()
+                    aria_label = (
+                        await button.get_attribute("aria-label") or ""
+                    ).lower()
+                    text = f"{label} {aria_label}"
+                    if not any(
+                        marker in text
+                        for marker in (
+                            "accept all",
+                            "accept",
+                            "reject optional",
+                            "拒绝",
+                            "接受",
+                            "同意",
+                        )
+                    ):
+                        continue
+                    if "manage settings" in text or "管理设置" in text:
+                        continue
+                    await button.click(force=True, timeout=1500)
+                    print("  cookie accepted")
+                    try:
+                        await page.locator("#onetrust-consent-sdk").wait_for(
+                            state="hidden",
+                            timeout=3000,
+                        )
+                    except PlaywrightTimeoutError:
+                        pass
+                    await asyncio.sleep(0.5)
+                    return
+                except Exception:
+                    continue
+        await asyncio.sleep(0.25)
 
 async def _open_signin_modal(page: Page) -> bool:
     """点击 header 的 Login，打开 signin 弹窗。
 
     实测：点 Login 后先出现临时弹窗，1~2 秒后页面自动刷新出真正有效弹窗。
     """
-    try:
-        login = page.get_by_role("button", name="Login").filter(visible=True).first
-        await login.wait_for(state="visible", timeout=10000)
-        await login.click()
-    except Exception as exc:
-        print(f"  Login click failed: {exc}")
+    deadline = time.monotonic() + 45
+    reported_missing = False
+    reload_count = 0
+    next_reload_at = time.monotonic() + 6
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        await _accept_cookie_banner(page, timeout_seconds=1)
+        login_selectors = (
+            page.get_by_role("button", name="Login").filter(visible=True).first,
+            page.locator(
+                "button[data-nvtrack-nav-object='login-button']:visible"
+            ).first,
+        )
+        clicked = False
+        for login in login_selectors:
+            try:
+                if await login.count() < 1:
+                    continue
+                await login.wait_for(
+                    state="visible",
+                    timeout=max(1000, min(5000, int(remaining * 1000))),
+                )
+                await login.click(timeout=5000)
+                clicked = True
+                break
+            except Exception as exc:
+                if not reported_missing:
+                    print(f"  Login click failed: {exc}")
+                    reported_missing = True
+                await _accept_cookie_banner(page, timeout_seconds=1)
 
-    # 等待邮箱输入框首次出现（第一个临时弹窗）
-    try:
-        await page.locator('input[name="email"]').first.wait_for(state="visible", timeout=8000)
-    except Exception:
-        pass
-
-    # 关键：等页面自动刷新出第二个有效弹窗。刷新会重建 DOM，
-    # 等 email 输入框稳定（连续多次拿到同一个可交互输入框）后再返回。
-    await _wait_for_stable_email_input(page)
-    return await page.locator('input[name="email"]:visible').count() > 0
+        # The first modal can be replaced by a fresh DOM after the click.
+        if clicked:
+            await _wait_for_stable_email_input(page)
+            if await page.locator('input[name="email"]:visible').count() > 0:
+                return True
+        if reload_count < 2 and time.monotonic() >= next_reload_at:
+            try:
+                await page.reload(
+                    wait_until="domcontentloaded",
+                    timeout=max(5000, min(15000, int(remaining * 1000))),
+                )
+                reload_count += 1
+                print(f"  build page reloaded ({reload_count}/2)")
+            except Exception as exc:
+                if not reported_missing:
+                    print(f"  build page reload failed: {exc}")
+                    reported_missing = True
+            next_reload_at = time.monotonic() + 6
+        else:
+            await asyncio.sleep(1)
+    return False
 
 async def _wait_for_stable_email_input(page: Page, settle_seconds: float = 3.0) -> None:
     """等待 signin 弹窗自动刷新完成，直到可见 email 输入框稳定。"""
-    deadline = time.time() + 15
+    deadline = time.time() + 20
     stable_since = None
     while time.time() < deadline:
         try:
@@ -313,12 +569,23 @@ async def _submit_email_step(page: Page, email: str) -> bool:
     except Exception:
         return False
 
-    try:
-        await page.wait_for_url("**/login.nvgs.nvidia.com/**", timeout=20000)
-        print(f"  navigated to: {page.url[:80]}")
-    except Exception:
-        await asyncio.sleep(5)
-    return True
+    # The broad /login URL is also the email step itself. Wait for the actual
+    # create-account route or for its password form before returning; otherwise
+    # concurrent headless sessions can start registration against the old page.
+    deadline = time.monotonic() + 45
+    while time.monotonic() < deadline:
+        try:
+            password_visible = await page.locator(
+                "#registration_password:visible"
+            ).count() > 0
+        except Exception:
+            password_visible = False
+        if password_visible or "create-account" in page.url:
+            print(f"  navigated to: {page.url[:80]}")
+            return True
+        await asyncio.sleep(0.5)
+    print(f"  create-account page did not appear: {page.url[:80]}")
+    return False
 
 async def register_account(
     page: Page,
@@ -332,7 +599,7 @@ async def register_account(
     # [1/4] 等待密码字段并填写
     print("\n[1/4] Fill password...")
     try:
-        await page.locator("#registration_password").wait_for(state="visible", timeout=30000)
+        await page.locator("#registration_password").wait_for(state="visible", timeout=45000)
     except PlaywrightTimeoutError:
         print("  password field never appeared")
         await _print_clickable_snapshot(page)
@@ -370,7 +637,10 @@ async def register_account(
 
     # 点击前记录已有邮件，避免把上一封验证码当成这次注册的结果。
     try:
-        known_message_ids = email_provider.snapshot_message_ids(inbox)
+        known_message_ids = await asyncio.to_thread(
+            email_provider.snapshot_message_ids,
+            inbox,
+        )
     except Exception as exc:
         print(f"  mailbox snapshot failed: {exc}")
         return False
@@ -385,7 +655,8 @@ async def register_account(
 
     # [3/4] 等待验证码邮件
     print("\n[3/4] Waiting for verification code email...")
-    code = email_provider.poll_verification_code(
+    code = await asyncio.to_thread(
+        email_provider.poll_verification_code,
         inbox,
         timeout_seconds=config.captcha.timeout_seconds,
         known_message_ids=known_message_ids,
@@ -407,9 +678,14 @@ async def register_account(
         print("  failed to type verification code")
         return False
 
-    # 点“继续”提交验证码
-    await _click_continue(page)
-    await asyncio.sleep(3)
+    # 点“继续”提交验证码，并确认页面真正接受了该验证码。
+    verification_url = page.url
+    if not await _click_continue(page):
+        print("  verification submit button not available")
+        return False
+    if not await _wait_for_verification_submission(page, verification_url):
+        print("  verification code was rejected or submission timed out")
+        return False
     print("\nRegistration submitted!")
     return True
 
@@ -440,6 +716,36 @@ async def _type_verification_code(page: Page, code: str) -> bool:
         await asyncio.sleep(0.15)
     await asyncio.sleep(0.5)
     return True
+
+
+async def _wait_for_verification_submission(
+    page: Page,
+    original_url: str,
+    timeout_seconds: int = 20,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    invalid_markers = (
+        "验证码无效",
+        "验证码已过期",
+        "invalid verification code",
+        "verification code is invalid",
+        "verification code has expired",
+    )
+    while time.monotonic() < deadline:
+        try:
+            body_text = (await page.locator("body").inner_text()).lower()
+            if any(marker in body_text for marker in invalid_markers):
+                return False
+            if page.url != original_url:
+                return True
+            if await page.locator('input[type="number"]:visible').count() < 6:
+                return True
+        except Exception:
+            if page.url != original_url:
+                return True
+        await asyncio.sleep(0.5)
+    return False
+
 
 async def _click_continue(page: Page) -> bool:
     """点验证码/同意页的主推进按钮（继续 / 提交）。"""
@@ -517,10 +823,11 @@ async def finalize_and_create_key(
       → select-account(填组织名) → complete-profile(session 已有效, 直接建 key)
     """
     print("\n[阶段C] 处理注册后跳转，直到 session 有效...")
-    deadline = time.time() + 240
+    deadline = time.monotonic() + 120
     last_url = ""
+    ngc_login_attempts = 0
 
-    while time.time() < deadline:
+    while time.monotonic() < deadline:
         # 每轮先尝试直接建 key（session 可能已经有效）
         org_name = await _get_org_name(page)
         if org_name:
@@ -546,11 +853,85 @@ async def finalize_and_create_key(
             await asyncio.sleep(3)
             continue
 
+        if "ngc.nvidia.com/signin" in url_now:
+            if ngc_login_attempts >= 2:
+                print("  NGC 登录重试耗尽")
+                return None
+            ngc_login_attempts += 1
+            print(f"  NGC session 丢失，重新登录 ({ngc_login_attempts}/2)...")
+            if not await _login_ngc(page, inbox.address, password):
+                print("  NGC 登录表单未能推进")
+                return None
+            continue
+
+        if "profile-complete" in url_now:
+            try:
+                if await page.locator('input[type="number"]:visible').count() >= 6:
+                    print("  仍停留在验证码页面，注册未完成")
+                    return None
+            except Exception:
+                pass
+
         # signin-redirect、complete-profile 等 → 等待跳转
         await asyncio.sleep(2)
 
     print("  阶段C 超时，未能建 key")
     return None
+
+
+async def _login_ngc(page: Page, email: str, password: str) -> bool:
+    """Advance the NGC login form after registration redirects without a session."""
+    original_url = page.url
+    submitted_password = False
+    for _ in range(4):
+        password_input = page.locator('input[type="password"]:visible').first
+        try:
+            if await password_input.count() > 0 and await password_input.is_visible():
+                await password_input.fill(password)
+                if not await _click_first_named_button(
+                    page,
+                    ("Log In", "Sign In", "Continue", "登录", "继续"),
+                ):
+                    return False
+                submitted_password = True
+                await asyncio.sleep(3)
+                continue
+        except Exception:
+            pass
+
+        email_input = page.locator(
+            'input[type="email"]:visible, input[name="email"]:visible, '
+            'input[autocomplete="email"]:visible, input[placeholder*="@"]:visible'
+        ).first
+        try:
+            if await email_input.count() > 0 and await email_input.is_visible():
+                await email_input.fill(email)
+                if not await _click_first_named_button(
+                    page,
+                    ("Continue", "Next", "继续", "下一步"),
+                ):
+                    return False
+                await asyncio.sleep(2)
+                continue
+        except Exception:
+            pass
+
+        if page.url != original_url:
+            return True
+        await asyncio.sleep(1)
+    return submitted_password and page.url != original_url
+
+
+async def _click_first_named_button(page: Page, names: tuple[str, ...]) -> bool:
+    for name in names:
+        try:
+            button = page.get_by_role("button", name=name).first
+            if await button.count() > 0 and await button.is_visible() and await button.is_enabled():
+                await button.click(timeout=5000)
+                return True
+        except Exception:
+            continue
+    return False
 
 async def _get_org_name(page: Page) -> str | None:
     """在浏览器上下文内 fetch user-context（credentials:include），拿 orgName。"""

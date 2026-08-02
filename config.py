@@ -42,6 +42,7 @@ class CaptchaConfig:
     llm_calls_per_attempt: int
     llm_max_attempts: int
     llm_max_output_tokens: int
+    llm_max_concurrency: int
     llm_artifact_dir: Path | None
     poll_interval_seconds: int
     timeout_seconds: int
@@ -58,6 +59,8 @@ class NvidiaConfig:
 @dataclass(frozen=True)
 class BrowserConfig:
     headless: bool
+    concurrency: int
+    launch_stagger_seconds: int
     close_delay_seconds: int
 
 
@@ -142,12 +145,13 @@ llm_model = ""
 llm_api_base = "https://api.openai.com/v1"
 llm_api_key = ""
 llm_reasoning_effort = "auto" # auto | none | minimal | low | medium | high | xhigh | max
-llm_call_delay_seconds = 5
-llm_action_delay_seconds = 5
-llm_calls_per_attempt = 10
+llm_call_delay_seconds = 1
+llm_action_delay_seconds = 1
+llm_calls_per_attempt = 8
 llm_max_attempts = 2
 llm_max_output_tokens = 1200
-llm_artifact_dir = "" # optional; saves screenshots and trace.jsonl
+llm_max_concurrency = 1
+llm_artifact_dir = "" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
 timeout_seconds = 180
 
@@ -159,6 +163,8 @@ key_expiry_date = "2126-05-08T08:00:00Z"
 
 [browser]
 headless = false
+concurrency = 1
+launch_stagger_seconds = 8
 close_delay_seconds = 5
 """
     CONFIG_FILE.write_text(template, encoding="utf-8")
@@ -242,11 +248,12 @@ def load_config() -> AppConfig:
         raise ValueError(
             "captcha.llm_model and captcha.llm_api_key are required when captcha.mode = 'llm'"
         )
-    llm_call_delay_seconds = _get_int(data, "captcha.llm_call_delay_seconds", 5)
-    llm_action_delay_seconds = _get_int(data, "captcha.llm_action_delay_seconds", 5)
-    llm_calls_per_attempt = _get_int(data, "captcha.llm_calls_per_attempt", 10)
+    llm_call_delay_seconds = _get_int(data, "captcha.llm_call_delay_seconds", 1)
+    llm_action_delay_seconds = _get_int(data, "captcha.llm_action_delay_seconds", 1)
+    llm_calls_per_attempt = _get_int(data, "captcha.llm_calls_per_attempt", 8)
     llm_max_attempts = _get_int(data, "captcha.llm_max_attempts", 2)
     llm_max_output_tokens = _get_int(data, "captcha.llm_max_output_tokens", 1200)
+    llm_max_concurrency = _get_int(data, "captcha.llm_max_concurrency", 1)
     llm_artifact_dir_value = _get_str(data, "captcha.llm_artifact_dir", "")
     if not 0 <= llm_call_delay_seconds <= 300:
         raise ValueError("captcha.llm_call_delay_seconds must be between 0 and 300")
@@ -258,6 +265,15 @@ def load_config() -> AppConfig:
         raise ValueError("captcha.llm_max_attempts must be between 1 and 10")
     if not 128 <= llm_max_output_tokens <= 32768:
         raise ValueError("captcha.llm_max_output_tokens must be between 128 and 32768")
+    if not 1 <= llm_max_concurrency <= 10:
+        raise ValueError("captcha.llm_max_concurrency must be between 1 and 10")
+
+    browser_concurrency = _get_int(data, "browser.concurrency", 1)
+    if not 1 <= browser_concurrency <= 10:
+        raise ValueError("browser.concurrency must be between 1 and 10")
+    launch_stagger_seconds = _get_int(data, "browser.launch_stagger_seconds", 8)
+    if not 0 <= launch_stagger_seconds <= 300:
+        raise ValueError("browser.launch_stagger_seconds must be between 0 and 300")
 
     return AppConfig(
         email_provider=email_provider,
@@ -289,6 +305,7 @@ def load_config() -> AppConfig:
             llm_calls_per_attempt=llm_calls_per_attempt,
             llm_max_attempts=llm_max_attempts,
             llm_max_output_tokens=llm_max_output_tokens,
+            llm_max_concurrency=llm_max_concurrency,
             llm_artifact_dir=(
                 _resolve_path(llm_artifact_dir_value)
                 if llm_artifact_dir_value
@@ -305,6 +322,8 @@ def load_config() -> AppConfig:
         ),
         browser=BrowserConfig(
             headless=_get_bool(data, "browser.headless", False),
+            concurrency=browser_concurrency,
+            launch_stagger_seconds=launch_stagger_seconds,
             close_delay_seconds=_get_int(data, "browser.close_delay_seconds", 10),
         ),
     )
@@ -322,5 +341,9 @@ def describe_config(config: AppConfig) -> None:
     print(f"  EMAIL_API:      {email_api}")
     print(f"  EMAIL_DOMAIN:   {email_domain}")
     print(f"  CAPTCHA_MODE:   {config.captcha.mode}")
+    print(f"  BROWSER_MODE:   {'headless' if config.browser.headless else 'headed'}")
+    print(f"  BROWSER_CONCURRENCY: {config.browser.concurrency}")
+    print(f"  LLM_CONCURRENCY:     {config.captcha.llm_max_concurrency}")
+    print(f"  LAUNCH_STAGGER: {config.browser.launch_stagger_seconds}s")
     print(f"  OUTPUT_CSV:     {config.nvidia.output_csv}")
     print(f"  CONFIG_FILE:    {CONFIG_FILE}")

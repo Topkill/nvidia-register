@@ -37,10 +37,12 @@ class CaptchaConfigTests(unittest.TestCase):
         self.assertIsNone(config.captcha.llm_model)
         self.assertIsNone(config.captcha.llm_api_key)
         self.assertEqual(config.captcha.llm_api_base, "https://api.openai.com/v1")
-        self.assertEqual(config.captcha.llm_calls_per_attempt, 10)
+        self.assertEqual(config.captcha.llm_calls_per_attempt, 8)
         self.assertEqual(config.captcha.llm_max_attempts, 2)
         self.assertEqual(config.captcha.llm_max_output_tokens, 1200)
+        self.assertEqual(config.captcha.llm_max_concurrency, 1)
         self.assertIsNone(config.captcha.llm_artifact_dir)
+        self.assertEqual(config.browser.launch_stagger_seconds, 8)
 
     def test_loads_llm_mode_without_changing_other_modes(self) -> None:
         config = self._load(
@@ -90,6 +92,17 @@ llm_calls_per_attempt = 0
 mode = "manual"
 llm_max_output_tokens = 64
 """
+            )
+
+    def test_browser_concurrency_defaults_to_one_and_is_validated(self) -> None:
+        self.assertEqual(self._load('mode = "manual"').browser.concurrency, 1)
+
+        with self.assertRaisesRegex(ValueError, "browser.concurrency"):
+            self._load('mode = "manual"\n\n[browser]\nconcurrency = 11')
+
+        with self.assertRaisesRegex(ValueError, "launch_stagger_seconds"):
+            self._load(
+                'mode = "manual"\n\n[browser]\nlaunch_stagger_seconds = 301'
             )
 
 

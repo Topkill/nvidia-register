@@ -21,12 +21,13 @@ llm_model = ""
 llm_api_base = "https://api.openai.com/v1"
 llm_api_key = ""
 llm_reasoning_effort = "auto" # auto | none | minimal | low | medium | high | xhigh | max
-llm_call_delay_seconds = 5
-llm_action_delay_seconds = 5
-llm_calls_per_attempt = 10
+llm_call_delay_seconds = 1
+llm_action_delay_seconds = 1
+llm_calls_per_attempt = 8
 llm_max_attempts = 2
 llm_max_output_tokens = 1200
-llm_artifact_dir = "" # optional; saves screenshots and trace.jsonl
+llm_max_concurrency = 1
+llm_artifact_dir = "" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
 timeout_seconds = 180
 
@@ -38,4 +39,6 @@ key_expiry_date = "2126-05-08T08:00:00Z"
 
 [browser]
 headless = false
+concurrency = 1
+launch_stagger_seconds = 8
 close_delay_seconds = 5

@@ -74,12 +74,13 @@ llm_model = ""
 llm_api_base = "https://api.openai.com/v1"
 llm_api_key = ""
 llm_reasoning_effort = "auto" # auto | none | minimal | low | medium | high | xhigh | max
-llm_call_delay_seconds = 5
-llm_action_delay_seconds = 5
-llm_calls_per_attempt = 10
+llm_call_delay_seconds = 1
+llm_action_delay_seconds = 1
+llm_calls_per_attempt = 8
 llm_max_attempts = 2
 llm_max_output_tokens = 1200
-llm_artifact_dir = "" # optional; saves screenshots and trace.jsonl
+llm_max_concurrency = 1
+llm_artifact_dir = "" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
 timeout_seconds = 180
 
@@ -91,6 +92,8 @@ key_expiry_date = "2126-05-08T08:00:00Z"
 
 [browser]
 headless = false
+concurrency = 1
+launch_stagger_seconds = 8
 close_delay_seconds = 5
 ```
 
@@ -118,7 +121,8 @@ close_delay_seconds = 5
 | `captcha.llm_calls_per_attempt` | 每轮最多调用模型的次数（1-50） |
 | `captcha.llm_max_attempts` | hCaptcha 重置后的最大轮数（1-10） |
 | `captcha.llm_max_output_tokens` | 单次模型调用的最大输出 token（128-32768） |
-| `captcha.llm_artifact_dir` | 可选调试目录，保存模型实际看到的截图和 `trace.jsonl`；默认关闭 |
+| `captcha.llm_max_concurrency` | LLM API 最大并发请求数（1-10，默认 1；独立于浏览器并发） |
+| `captcha.llm_artifact_dir` | 可选失败诊断目录；截图去重，成功会话自动删除，仅保留最近 20 个失败/超时会话 |
 | `captcha.poll_interval_seconds` | 验证码结果轮询间隔（秒） |
 | `captcha.timeout_seconds` | 验证码等待超时时间（秒） |
 | `nvidia.output_csv` | 记录输出 CSV 文件路径 |
@@ -126,6 +130,8 @@ close_delay_seconds = 5
 | `nvidia.account_name` | 创建组织账户时填入的名称（用于跳过手机验证） |
 | `nvidia.key_expiry_date` | API Key 过期时间（默认 ~100 年） |
 | `browser.headless` | 是否无头模式运行浏览器 |
+| `browser.concurrency` | 隔离浏览器会话的最大并发数（1-10，默认 1） |
+| `browser.launch_stagger_seconds` | 相邻浏览器会话启动的最小间隔（0-300 秒，默认 8） |
 | `browser.close_delay_seconds` | 完成后浏览器关闭延迟秒数 |
 
 ## 使用
@@ -137,9 +143,31 @@ python main.py
 # 直接指定注册数量（不询问）
 python main.py -n 5
 python main.py --count 3
+
+# 无头浏览器 + LLM 视觉识图（覆盖 browser.headless 配置）
+python main.py --headless -n 1
+
+# 同时运行 3 个相互隔离的无头会话，共注册 10 个账号
+python main.py --headless -n 10 -j 3
+
+# 临时切回有头浏览器排障
+python main.py --headed -n 1
 ```
 
-批量注册时每个账号使用独立的浏览器会话，间隔 5 秒。`Ctrl+C` 优雅退出：完成当前正在注册的账号后停止，显示成功/失败汇总。
+批量注册使用固定大小的 worker 池，每个账号拥有独立浏览器会话。`Ctrl+C` 后不再领取新账号，
+当前并发中的账号完成后显示成功/失败汇总。
+`--headless`、`--headed` 和 `-j/--concurrency` 只覆盖本次运行，不修改 `config.toml`。无头模式必须配合
+`llm`、`yescaptcha` 或 `captcharun` 自动验证码模式；`manual` 无法显示挑战，程序会在启动时
+直接拒绝该组合。
+
+每个并发任务使用独立的 Browser、Context、Page、临时邮箱和验证码 solver；hCaptcha sitekey
+也按 Page 隔离。同步邮箱轮询在独立线程运行，CSV 记录通过锁串行追加，因此一个会话等待
+邮件或识图时不会阻塞或污染其他会话。
+
+浏览器并发和 LLM API 并发分别控制。多个验证码会话可以同时推进，但只有实际的模型 HTTP
+请求受 `llm_max_concurrency` 限制；默认串行请求，以减少兼容接口的 503、TLS 中断和限流错误，
+不会再让一个验证码独占请求槽直到整场结束。失败账号会在 `failure_artifacts/` 下保存阶段、URL 和页面
+截图；其中可能包含注册邮箱，排障完成后应删除。
 
 每次注册成功会自动追加记录到 `accounts.csv`：
 
@@ -154,10 +182,14 @@ nv12345678@your-domain.com,aB3dE5fG7hI9,nvapi-xxxx...
 同时从 DOM 读取挑战题目，再发送到 Responses API。canvas 无法导出时才退回 iframe/视口
 截图。其他验证码模式仍可通过原有选项选择。
 
-默认首次截图前等待 5 秒，每轮最多调用 10 次，最多执行 2 轮；一轮失败后会尝试重置
-hCaptcha。每次模型调用最多执行一个点击或拖动，页面更新后重新定位 hCaptcha iframe 并
-截图，避免继续使用过期画面中的坐标。模型返回 `verify` 后，程序通过 DOM 点击 hCaptcha
-自己的 `Verify`/`Check` 控件；拖拽题会在一次拖拽后直接尝试该控件。
+LLM 模式可在无头 Chromium 中运行，推荐使用 `python main.py --headless -n 1`。浏览器截图、
+canvas 导出和鼠标坐标映射都由 Playwright 页面对象完成，不依赖桌面显示服务。
+
+默认相邻截图/动作等待 1 秒，每轮最多调用 8 次，最多执行 2 轮；一轮失败后会尝试重置
+hCaptcha。普通题每次模型调用最多执行一个点击或拖动；3×3 多选题允许一次返回最多 9 个
+格子，控制器逐格执行后自动点击 hCaptcha 的 `Verify`/`Check`。checkbox 小帧只由 DOM 操作，
+不会发送给模型，避免 iframe 切换后继续使用旧坐标。模型请求遇到网络异常、429 或 5xx 时，
+会在同一个 30 秒总预算内进行至多一次瞬时重试。
 
 对于固定 4×4 的动物补位题，程序会先在原生 canvas 上比较每行图标、空格和两个候选的
 像素差。只有异常行、空格和候选匹配三项置信度都达到阈值时，才使用网格中心坐标执行；
@@ -170,7 +202,15 @@ hCaptcha。每次模型调用最多执行一个点击或拖动，页面更新后
 {
   "status": "actions",
   "actions": [
-    {"kind": "click", "start_x": 120, "start_y": 80, "end_x": null, "end_y": null}
+    {
+      "kind": "click",
+      "start_x": 190,
+      "start_y": 323,
+      "end_x": null,
+      "end_y": null,
+      "grid_row": 1,
+      "grid_column": 1
+    }
   ],
   "message": "",
   "coordinate_space": "normalized_1000"
@@ -178,11 +218,15 @@ hCaptcha。每次模型调用最多执行一个点击或拖动，页面更新后
 ```
 
 `status` 支持 `actions`、`verify` 和 `solved`（解析器仍兼容旧的 `failed` 响应）。坐标固定
-使用 0-1000 归一化空间；原生 canvas 坐标会按它的 CSS 显示比例映射回页面，超出截图
-范围的动作会被拒绝。API 需要兼容 Responses 的 `input_image` 和严格 JSON Schema 输出。
+使用 0-1000 归一化空间；3×3 DOM 网格还必须给出从 1 开始的 `grid_row/grid_column`，控制器
+优先按行列落到格子中心，其他任务将这两个字段设为 `null`。原生 canvas 坐标会按它的 CSS
+显示比例映射回页面，超出截图范围的动作会被拒绝。API 需要兼容 Responses 的 `input_image`
+和严格 JSON Schema 输出。
 第三方兼容接口即使返回 Markdown 包裹的 JSON 也会尝试提取；若配置了
-`llm_artifact_dir`，其中会记录原始响应、canvas/CSS 缩放、局部坐标和最终页面坐标。回退
-截图可能包含当前注册页面信息，排障完成后应删除该目录。
+`llm_artifact_dir`，其中会记录原始响应、canvas/CSS 缩放、局部坐标和最终页面坐标。相同截图
+只写一次，每个失败会话最多保留 16 张常规截图，并仅保留最近 20 个失败/超时会话；成功会话
+立即删除，超过 10 分钟且已超过两倍验证码超时的异常中断目录也会纳入清理。回退截图可能
+包含当前注册页面信息，排障完成后仍应删除不再需要的目录。
 
 ## 注册流程
 

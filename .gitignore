@@ -6,6 +6,7 @@ config.toml
 accounts.csv
 nvidia_api_key.txt
 captcha_artifacts/
+failure_artifacts/
 
 # Python
 __pycache__/
