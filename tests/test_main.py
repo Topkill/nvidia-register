@@ -19,6 +19,9 @@ from main import (
     _parse_cli_options,
     _redact_artifact_url,
     _run_accounts,
+    _skip_passkey_prompt,
+    _skip_passkey_prompt_if_present,
+    _wait_for_url_change,
     _wait_for_verification_submission,
     run,
 )
@@ -164,6 +167,95 @@ class ParallelSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(maximum_active, 2)
         self.assertEqual(sorted(account_indices), [0, 1, 2, 3, 4])
         self.assertEqual(sorted(results), [f"key-{index}" for index in range(5)])
+
+
+class PasskeyPromptTests(unittest.IsolatedAsyncioTestCase):
+    def _cancel_button_page(self, cancel_count: int = 1) -> tuple[object, Mock]:
+        """Build a page whose #cancelSetupSelect_btn exists and whose named
+        buttons (confirm dialog) are all clickable."""
+        cancel = Mock()
+        cancel.count = AsyncMock(return_value=cancel_count)
+        cancel.first = cancel
+        cancel.click = AsyncMock()
+
+        confirm = Mock()
+        confirm.count = AsyncMock(return_value=1)
+        confirm.is_enabled = AsyncMock(return_value=True)
+        confirm.click = AsyncMock()
+        confirm.filter = Mock(return_value=confirm)
+        confirm.first = confirm
+
+        page = Mock()
+        page.locator.return_value = cancel
+        page.get_by_role.return_value = confirm
+        return page, cancel
+
+    async def test_skip_prompt_clicks_cancel_then_confirms(self) -> None:
+        page, cancel = self._cancel_button_page()
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            skipped = await _skip_passkey_prompt(page)
+
+        self.assertTrue(skipped)
+        cancel.click.assert_awaited_once()
+        page.get_by_role().click.assert_awaited()
+
+    async def test_skip_prompt_polls_until_passkey_url_appears(self) -> None:
+        page, cancel = self._cancel_button_page()
+        page.url = "https://login.nvgs.nvidia.com/v1/profile-complete"
+
+        async def fake_sleep(_seconds: float) -> None:
+            page.url = "https://login.nvgs.nvidia.com/v1/passkey/prompt-setup?x=1"
+
+        with patch("main.asyncio.sleep", new=AsyncMock(side_effect=fake_sleep)):
+            skipped = await _skip_passkey_prompt_if_present(page, wait_seconds=15)
+
+        self.assertTrue(skipped)
+        cancel.click.assert_awaited_once()
+
+    async def test_skip_prompt_returns_false_when_never_present(self) -> None:
+        page = Mock()
+        page.url = "https://login.nvgs.nvidia.com/v1/signin-redirect"
+        page.locator.return_value.count = AsyncMock(return_value=0)
+        page.get_by_role.return_value.count = AsyncMock(return_value=0)
+        page.get_by_role.return_value.is_enabled = AsyncMock(return_value=False)
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            skipped = await _skip_passkey_prompt_if_present(page, wait_seconds=0.05)
+
+        self.assertFalse(skipped)
+
+    async def test_skip_prompt_exits_early_after_moving_past_passkey(self) -> None:
+        page = Mock()
+        page.url = "https://login.nvgs.nvidia.com/v1/consent"
+        page.locator.return_value.count = AsyncMock(return_value=0)
+
+        with patch("main.asyncio.sleep", new=AsyncMock()) as mocked_sleep:
+            skipped = await _skip_passkey_prompt_if_present(page, wait_seconds=30)
+
+        self.assertFalse(skipped)
+        mocked_sleep.assert_not_awaited()
+
+    async def test_wait_for_url_change_detects_navigation(self) -> None:
+        page = Mock()
+        page.url = "https://login.nvgs.nvidia.com/v1/passkey/prompt-setup"
+
+        async def fake_sleep(_seconds: float) -> None:
+            page.url = "https://login.nvgs.nvidia.com/v1/signin-redirect"
+
+        with patch("main.asyncio.sleep", new=AsyncMock(side_effect=fake_sleep)):
+            changed = await _wait_for_url_change(page, page.url, wait_seconds=5)
+
+        self.assertTrue(changed)
+
+    async def test_wait_for_url_change_times_out(self) -> None:
+        page = Mock()
+        page.url = "https://login.nvgs.nvidia.com/v1/passkey/prompt-setup"
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            changed = await _wait_for_url_change(page, page.url, wait_seconds=0.05)
+
+        self.assertFalse(changed)
 
 
 def _app_config(captcha_mode: str, concurrency: int = 1) -> AppConfig:

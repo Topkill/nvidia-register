@@ -14,6 +14,7 @@
 - **邮箱服务**：支持 `cloudflare_temp_email`（自部署）和 `duckmail`（DuckMail API）
 - **随机密码**：每次注册自动生成 12 位密码（大小写 + 数字）
 - **自动跳过手机验证**：利用组织名注册跳过手机号要求，并创建长效 API Key
+- **自动跳过通行密钥引导**：邮箱验证后 NVIDIA 会插入"创建通行密钥"页（`/v1/passkey/prompt-setup`），程序自动点"稍后再说"并确认，避免流程卡死
 - **CSV 记录**：每次注册成功立即追加 `email,password,apikey` 到 CSV 文件
 - **优雅退出**：`Ctrl+C` 完成当前账号后安全退出
 
@@ -278,8 +279,8 @@ hCaptcha。普通题每次模型调用最多执行一个点击或拖动；3×3 �
 
 ```
 build.nvidia.com (填邮箱) → login.nvgs.nvidia.com (填密码 + hCaptcha)
-→ 验证码页 (键盘输入) → 同意页 (提交) → 创建组织 (跳过手机验证)
-→ NGC API (建 Key) → CSV 记录
+→ 验证码页 (键盘输入) → 通行密钥页 (自动点"稍后再说"跳过) → 同意页 (提交)
+→ 创建组织 (跳过手机验证) → NGC API (建 Key) → CSV 记录
 ```
 
 ## 扩展邮箱服务

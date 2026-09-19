@@ -4,7 +4,8 @@ nvidia-register — 注册 build.nvidia.com 账号并创建 AI_PLAYGROUNDS_KEY
 
 完整流程（基于真实页面链路，全部实测确认）：
   创建临时邮箱 → build.nvidia.com 填邮箱 → create-account 页填密码 + 过 hCaptcha
-  → 验证码页真实键盘输入 → 同意/快完成页 → (session 丢失) 邮箱+密码重新登录
+  → 验证码页真实键盘输入 → 通行密钥引导页(自动点"稍后再说"跳过)
+  → 同意/快完成页 → (session 丢失) 邮箱+密码重新登录
   → 创建组织跳过手机验证 → 调 NGC API 建 key → 记录到 CSV
 
 用法:
@@ -686,6 +687,10 @@ async def register_account(
     if not await _wait_for_verification_submission(page, verification_url):
         print("  verification code was rejected or submission timed out")
         return False
+
+    # 验证码通过后 NVIDIA 会插入"创建通行密钥"引导页（/v1/passkey/prompt-setup），
+    # 先自动跳过它（点"稍后再说" + 确认对话框"确定"），否则流程会卡死在该页。
+    await _skip_passkey_prompt_if_present(page)
     print("\nRegistration submitted!")
     return True
 
@@ -760,6 +765,96 @@ async def _click_continue(page: Page) -> bool:
             continue
     return False
 
+# 通行密钥引导页（/v1/passkey/prompt-setup）的跳过按钮与二次确认对话框按钮名。
+# 页面语言随 locale 变化，所以中英文名称都试一遍。
+_PASSKEY_SKIP_BUTTON_NAMES = ("稍后再说", "Maybe later", "Not now", "Skip")
+_CONFIRM_BUTTON_NAMES = ("确定", "OK", "Confirm", "Yes", "是")
+
+async def _click_button_by_names(page: Page, names: tuple[str, ...], timeout_ms: int = 5000) -> str | None:
+    """按可访问名依次点击可见且可用的按钮，返回命中的名称；全部未命中返回 None。"""
+    for name in names:
+        try:
+            button = page.get_by_role("button", name=name).filter(visible=True).first
+            if await button.count() > 0 and await button.is_enabled():
+                await button.click(timeout=timeout_ms)
+                return name
+        except Exception:
+            continue
+    return None
+
+async def _confirm_skip_dialog(page: Page) -> bool:
+    """点掉"确定要跳过设置通行密钥吗"确认对话框。"""
+    for _ in range(10):
+        clicked = await _click_button_by_names(page, _CONFIRM_BUTTON_NAMES, timeout_ms=3000)
+        if clicked:
+            print(f"  passkey 确认对话框：已点击 [{clicked}]")
+            return True
+        await asyncio.sleep(0.5)
+    return False
+
+async def _skip_passkey_prompt(page: Page) -> bool:
+    """跳过"创建通行密钥"引导页（/v1/passkey/prompt-setup）。
+
+    NVIDIA 在邮箱验证之后新增了这一步，页面上有两个按钮：
+      #cancelSetupSelect_btn → "稍后再说"（我们要点的）
+      #setUpPasskey_btn      → "立即创建"（会拉起 WebAuthn，自动化环境无法完成）
+
+    点"稍后再说"之后还会弹一个确认对话框（"您确定要跳过设置通行密钥吗？"），
+    必须再点"确定"才会真正离开该页。
+    """
+    try:
+        skip_btn = page.locator("#cancelSetupSelect_btn")
+        if await skip_btn.count() > 0:
+            await skip_btn.first.click(timeout=5000)
+            print("  passkey 引导页：已点击 [稍后再说]")
+            await _confirm_skip_dialog(page)
+            return True
+    except Exception:
+        pass
+
+    clicked = await _click_button_by_names(page, _PASSKEY_SKIP_BUTTON_NAMES)
+    if clicked:
+        print(f"  passkey 引导页：已点击 [{clicked}]")
+        await _confirm_skip_dialog(page)
+        return True
+
+    print("  passkey 引导页：未找到跳过按钮")
+    await _print_clickable_snapshot(page)
+    return False
+
+async def _skip_passkey_prompt_if_present(page: Page, wait_seconds: int = 15) -> bool:
+    """等待并跳过可能出现的通行密钥引导页；没出现就直接返回，不阻塞后续流程。
+
+    验证码通过后页面可能还没跳转到 /v1/passkey/prompt-setup，所以先轮询 URL 与
+    DOM；若已经进入同意页/组织页等后续环节，说明本次没有通行密钥引导页，提前结束。
+    """
+    deadline = time.monotonic() + wait_seconds
+    moved_on_markers = ("consent", "static-login", "select-account", "cloudaccounts")
+    while time.monotonic() < deadline:
+        url_now = page.url
+        if "passkey" in url_now:
+            return await _skip_passkey_prompt(page)
+        # 已经跳到后续页面，说明没有出现通行密钥引导页
+        if any(marker in url_now for marker in moved_on_markers):
+            return False
+        # URL 跳转可能滞后于 DOM：跳过按钮已出现就直接处理
+        try:
+            if await page.locator("#cancelSetupSelect_btn:visible").count() > 0:
+                return await _skip_passkey_prompt(page)
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    return False
+
+async def _wait_for_url_change(page: Page, current_url: str, wait_seconds: int) -> bool:
+    """等页面自行跳走。返回 True 表示 URL 已变化。"""
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        await asyncio.sleep(1)
+        if page.url != current_url:
+            return True
+    return False
+
 async def _ensure_hcaptcha_hook(page: Page) -> None:
     """用 page.add_init_script 在所有后续页面加载前注册 hCaptcha 拦截器。
 
@@ -819,7 +914,8 @@ async def finalize_and_create_key(
     """注册提交后依次处理页面跳转，直到 session 有效并建 key。
 
     真实跳转链（实测确认）：
-      验证码提交 → signin-redirect → consent 页(点"提交")
+      验证码提交 → passkey/prompt-setup 页(点"稍后再说"跳过)
+      → signin-redirect → consent 页(点"提交")
       → select-account(填组织名) → complete-profile(session 已有效, 直接建 key)
     """
     print("\n[阶段C] 处理注册后跳转，直到 session 有效...")
@@ -838,6 +934,16 @@ async def finalize_and_create_key(
         if url_now != last_url:
             print(f"  当前页面: {url_now[:90]}")
             last_url = url_now
+
+        # 通行密钥引导页 → 点"稍后再说"跳过。
+        # register_account 里已尝试过跳过，此处 URL 可能只是还没来得及跳走，
+        # 所以先给它一点时间自行离开，避免重复点击与无意义的告警。
+        if "passkey" in url_now:
+            if await _wait_for_url_change(page, url_now, wait_seconds=5):
+                continue
+            await _skip_passkey_prompt(page)
+            await asyncio.sleep(3)
+            continue
 
         # 创建组织页（利用组织名跳过手机验证）
         if "select-account" in url_now or "cloudaccounts.nvidia.com" in url_now:
