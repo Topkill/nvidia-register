@@ -28,6 +28,7 @@ from main import (
     _wait_for_register_response,
     _wait_for_url_change,
     _wait_for_verification_submission,
+    register_account,
     run,
 )
 
@@ -376,6 +377,92 @@ class RobustnessTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(recovered)
         page.goto.assert_awaited_once()
+
+
+class RegisterAccountRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_types_verification_code_before_clicking_continue(self) -> None:
+        """回归：验证码重试循环里，第一次尝试也必须真实输入验证码。
+
+        曾把 _type_verification_code 误放进 code_attempt > 1 分支，导致第一次
+        尝试不输码直接点"继续"（按钮因数字未填而 disabled）→ 注册失败。
+        "继续"按钮 mock 只在 6 位数字输入完成后才可用，能复现该 bug。
+        """
+        inputs = Mock()
+        inputs.count = AsyncMock(return_value=6)
+        first = Mock()
+        first.click = AsyncMock()
+        nth = Mock()
+        nth.click = AsyncMock()
+        inputs.first = first
+        inputs.nth = Mock(return_value=nth)
+
+        visible_inputs = Mock()
+        visible_inputs.count = AsyncMock(return_value=0)
+
+        continue_button = Mock()
+        continue_button.count = AsyncMock(return_value=1)
+        continue_button.is_enabled = AsyncMock(
+            side_effect=lambda: page.keyboard.type.await_count >= 6
+        )
+        continue_button.click = AsyncMock()
+        continue_button.first = continue_button
+        continue_button.filter = Mock(return_value=continue_button)
+
+        body = Mock()
+        body.inner_text = AsyncMock(return_value="Processing")
+
+        cancel = Mock()
+        cancel.count = AsyncMock(return_value=1)
+        cancel.click = AsyncMock()
+        cancel.first = cancel
+
+        locators = {
+            "#registration_password": Mock(wait_for=AsyncMock()),
+            "#stay_signin_checkbox_v2-input": Mock(count=AsyncMock(return_value=0)),
+            "#register_button": Mock(
+                wait_for=AsyncMock(),
+                is_enabled=AsyncMock(return_value=True),
+                click=AsyncMock(),
+            ),
+            'input[type="number"]': inputs,
+            'input[type="number"]:visible': visible_inputs,
+            "body": body,
+            "#cancelSetupSelect_btn": cancel,
+        }
+
+        page = Mock()
+        page.fill = AsyncMock()
+        page.keyboard = Mock()
+        page.keyboard.type = AsyncMock()
+        page.locator = Mock(side_effect=lambda selector: locators[selector])
+        page.get_by_role = Mock(return_value=continue_button)
+        page.url = "https://login.nvgs.nvidia.com/v1/passkey/prompt-setup?x=1"
+        page.evaluate = AsyncMock(return_value=True)
+        page.wait_for_event = AsyncMock(
+            return_value=Mock(
+                status=200,
+                url="https://login.nvgs.nvidia.com/api/1/frontend/oauth/user/register",
+                request=Mock(method="POST"),
+                text=AsyncMock(return_value="{}"),
+            )
+        )
+
+        email_provider = Mock()
+        email_provider.snapshot_message_ids = Mock(return_value=set())
+        email_provider.poll_verification_code = Mock(return_value="123456")
+
+        solver = Mock()
+        solver.solve = AsyncMock(return_value=True)
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            ok = await register_account(
+                page, None, "Secret1234", email_provider, solver, _app_config("llm")
+            )
+
+        self.assertTrue(ok)
+        # 6 位验证码必须真实键入，而不是直接去点"继续"
+        self.assertEqual(page.keyboard.type.await_count, 6)
+        continue_button.click.assert_awaited()
 
 
 def _app_config(captcha_mode: str, concurrency: int = 1) -> AppConfig:

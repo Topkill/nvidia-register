@@ -683,14 +683,17 @@ async def register_account(
                 print("  未收到新验证码")
                 return False
             print(f"  新验证码: {code}")
-            # 新验证码到达后输入框可能被清空/重建，重新等待并输入
+            # 新验证码到达后输入框可能被清空/重建，重新等待出现
             if not await _wait_for_verification_inputs(page, timeout_seconds=45):
                 print("  verification inputs not detected")
                 await _print_clickable_snapshot(page)
                 return False
-            if not await _type_verification_code(page, code):
-                print("  failed to type verification code")
-                return False
+
+        # 每次尝试都要真实键盘输入验证码（React 受控组件，JS setValue 无效）。
+        # 注意：第一次尝试也要输入，否则"继续"按钮因 6 位数字未填而保持 disabled。
+        if not await _type_verification_code(page, code):
+            print("  failed to type verification code")
+            return False
 
         # 点“继续”提交验证码，并确认页面真正接受了该验证码。
         verification_url = page.url
