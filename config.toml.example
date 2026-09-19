@@ -31,6 +31,7 @@ llm_max_concurrency = 1
 llm_artifact_dir = "failure_artifacts/llm" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
 timeout_seconds = 240
+llm_request_timeout_seconds = 30 # per-request read timeout cap in seconds (5-600); raise for slow LLM endpoints
 
 [nvidia]
 output_csv = "accounts.csv"

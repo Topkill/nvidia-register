@@ -97,6 +97,7 @@ llm_max_concurrency = 1
 llm_artifact_dir = "failure_artifacts/llm" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
 timeout_seconds = 240
+llm_request_timeout_seconds = 30 # 单次模型请求的读超时上限（秒），慢端点可调大（5-600）
 
 [nvidia]
 output_csv = "accounts.csv"
@@ -140,6 +141,7 @@ close_delay_seconds = 5
 | `captcha.llm_artifact_dir` | 可选失败诊断目录；截图去重，成功会话自动删除，仅保留最近 20 个失败/超时会话 |
 | `captcha.poll_interval_seconds` | 验证码结果轮询间隔（秒） |
 | `captcha.timeout_seconds` | 验证码等待超时时间（秒） |
+| `captcha.llm_request_timeout_seconds` | 单次模型请求的读超时上限（秒，5-600，默认 30）；接口响应慢时（如免费 relay 经常 30s+）调大，否则会 `Read timed out` |
 | `nvidia.output_csv` | 记录输出 CSV 文件路径 |
 | `nvidia.key_name` | API Key 名称 |
 | `nvidia.account_name` | 创建组织账户时填入的名称（用于跳过手机验证） |

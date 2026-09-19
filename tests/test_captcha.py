@@ -690,6 +690,61 @@ class LLMCaptchaTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_request_timeout_seconds_defaults_to_30(self) -> None:
+        solver = LLMCaptchaSolver(
+            "vision-model",
+            "https://api.example.test/v1",
+            "key",
+            30,
+        )
+        self.assertEqual(solver.request_timeout_seconds, 30)
+
+    def test_request_timeout_seconds_caps_the_per_request_timeout(self) -> None:
+        response = Mock(ok=True, status_code=200)
+        response.json.return_value = {
+            "id": "response-1",
+            "output_text": (
+                '{"status":"solved","actions":[],"message":"done"}'
+            ),
+        }
+        solver = LLMCaptchaSolver(
+            "vision-model",
+            "https://api.example.test/v1",
+            "key",
+            30,
+            request_timeout_seconds=90,
+        )
+
+        with patch("captcha.requests.post", return_value=response) as post:
+            solver._request_decision(
+                b"png", 1280, 800, 1, 1, request_timeout_seconds=120
+            )
+
+        self.assertAlmostEqual(post.call_args.kwargs["timeout"], 90.0, delta=1.0)
+
+    def test_request_timeout_uses_whichever_deadline_is_smaller(self) -> None:
+        response = Mock(ok=True, status_code=200)
+        response.json.return_value = {
+            "id": "response-1",
+            "output_text": (
+                '{"status":"solved","actions":[],"message":"done"}'
+            ),
+        }
+        solver = LLMCaptchaSolver(
+            "vision-model",
+            "https://api.example.test/v1",
+            "key",
+            30,
+            request_timeout_seconds=90,
+        )
+
+        with patch("captcha.requests.post", return_value=response) as post:
+            solver._request_decision(
+                b"png", 1280, 800, 1, 1, request_timeout_seconds=20
+            )
+
+        self.assertAlmostEqual(post.call_args.kwargs["timeout"], 20.0, delta=1.0)
+
     def test_dom_multi_select_request_allows_a_full_grid_batch(self) -> None:
         response = Mock(ok=True, status_code=200)
         response.json.return_value = {

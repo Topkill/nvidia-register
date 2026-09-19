@@ -47,6 +47,7 @@ class CaptchaConfig:
     llm_artifact_dir: Path | None
     poll_interval_seconds: int
     timeout_seconds: int
+    llm_request_timeout_seconds: int = 30
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,7 @@ llm_max_concurrency = 1
 llm_artifact_dir = "failure_artifacts/llm" # optional; keeps bounded failure screenshots and trace.jsonl
 poll_interval_seconds = 3
 timeout_seconds = 240
+llm_request_timeout_seconds = 30 # 单次模型请求的读超时上限（秒），慢端点可调大（5-600）
 
 [nvidia]
 output_csv = "accounts.csv"
@@ -264,6 +266,9 @@ def load_config() -> AppConfig:
     llm_max_output_tokens = _get_int(data, "captcha.llm_max_output_tokens", 1200)
     llm_max_concurrency = _get_int(data, "captcha.llm_max_concurrency", 1)
     llm_artifact_dir_value = _get_str(data, "captcha.llm_artifact_dir", "")
+    llm_request_timeout_seconds = _get_int(
+        data, "captcha.llm_request_timeout_seconds", 30
+    )
     if not 0 <= llm_call_delay_seconds <= 300:
         raise ValueError("captcha.llm_call_delay_seconds must be between 0 and 300")
     if not 0 <= llm_action_delay_seconds <= 300:
@@ -276,6 +281,8 @@ def load_config() -> AppConfig:
         raise ValueError("captcha.llm_max_output_tokens must be between 128 and 32768")
     if not 1 <= llm_max_concurrency <= 10:
         raise ValueError("captcha.llm_max_concurrency must be between 1 and 10")
+    if not 5 <= llm_request_timeout_seconds <= 600:
+        raise ValueError("captcha.llm_request_timeout_seconds must be between 5 and 600")
 
     browser_concurrency = _get_int(data, "browser.concurrency", 1)
     if not 1 <= browser_concurrency <= 10:
@@ -323,6 +330,7 @@ def load_config() -> AppConfig:
             ),
             poll_interval_seconds=_get_int(data, "captcha.poll_interval_seconds", 3),
             timeout_seconds=_get_int(data, "captcha.timeout_seconds", 180),
+            llm_request_timeout_seconds=llm_request_timeout_seconds,
         ),
         nvidia=NvidiaConfig(
             output_csv=_resolve_path(_get_str(data, "nvidia.output_csv", "accounts.csv")),

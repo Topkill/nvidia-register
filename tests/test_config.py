@@ -42,6 +42,7 @@ class CaptchaConfigTests(unittest.TestCase):
         self.assertEqual(config.captcha.llm_max_attempts, 2)
         self.assertEqual(config.captcha.llm_max_output_tokens, 1200)
         self.assertEqual(config.captcha.llm_max_concurrency, 1)
+        self.assertEqual(config.captcha.llm_request_timeout_seconds, 30)
         self.assertIsNone(config.captcha.llm_artifact_dir)
         self.assertEqual(config.browser.launch_stagger_seconds, 8)
 
@@ -59,6 +60,7 @@ llm_action_delay_seconds = 2
 llm_calls_per_attempt = 3
 llm_max_attempts = 4
 llm_max_output_tokens = 2048
+llm_request_timeout_seconds = 90
 llm_artifact_dir = "debug/captcha"
 """
         )
@@ -74,6 +76,7 @@ llm_artifact_dir = "debug/captcha"
         self.assertEqual(config.captcha.llm_calls_per_attempt, 3)
         self.assertEqual(config.captcha.llm_max_attempts, 4)
         self.assertEqual(config.captcha.llm_max_output_tokens, 2048)
+        self.assertEqual(config.captcha.llm_request_timeout_seconds, 90)
         self.assertTrue(str(config.captcha.llm_artifact_dir).endswith("debug/captcha"))
 
     def test_llm_mode_requires_model_and_api_key(self) -> None:
@@ -100,6 +103,14 @@ llm_calls_per_attempt = 0
                 """
 mode = "manual"
 llm_max_output_tokens = 64
+"""
+            )
+
+        with self.assertRaisesRegex(ValueError, "llm_request_timeout_seconds"):
+            self._load(
+                """
+mode = "manual"
+llm_request_timeout_seconds = 4
 """
             )
 

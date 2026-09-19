@@ -188,6 +188,7 @@ class LLMCaptchaSolver:
     api_base: str
     api_key: str
     timeout_seconds: int
+    request_timeout_seconds: int = LLM_REQUEST_MAX_SECONDS
     reasoning_effort: str | None = None
     call_delay_seconds: int = LLM_CALL_DELAY_SECONDS
     action_delay_seconds: int = LLM_ACTION_DELAY_SECONDS
@@ -1367,7 +1368,7 @@ class LLMCaptchaSolver:
             endpoint = _responses_endpoint(self.api_base)
             api_name = "Responses API"
         request_budget = min(
-            float(LLM_REQUEST_MAX_SECONDS),
+            float(self.request_timeout_seconds),
             max(
                 0.1,
                 request_timeout_seconds
@@ -3589,6 +3590,7 @@ def build_captcha_solver(
             api_key=config.llm_api_key,
             api_protocol=config.llm_api_protocol,
             timeout_seconds=config.timeout_seconds,
+            request_timeout_seconds=config.llm_request_timeout_seconds,
             reasoning_effort=config.llm_reasoning_effort,
             call_delay_seconds=config.llm_call_delay_seconds,
             action_delay_seconds=config.llm_action_delay_seconds,
