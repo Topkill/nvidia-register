@@ -15,12 +15,17 @@ from config import (
 )
 from main import (
     _chromium_user_agent,
+    _click_register_and_wait_result,
     _login_ngc,
     _parse_cli_options,
+    _recover_from_navigation_error,
     _redact_artifact_url,
+    _request_new_verification_code,
     _run_accounts,
     _skip_passkey_prompt,
     _skip_passkey_prompt_if_present,
+    _solve_captcha_and_submit,
+    _wait_for_register_response,
     _wait_for_url_change,
     _wait_for_verification_submission,
     run,
@@ -256,6 +261,121 @@ class PasskeyPromptTests(unittest.IsolatedAsyncioTestCase):
             changed = await _wait_for_url_change(page, page.url, wait_seconds=0.05)
 
         self.assertFalse(changed)
+
+
+class RobustnessTests(unittest.IsolatedAsyncioTestCase):
+    def _register_page(self, response_statuses: list[int]) -> tuple[object, object, list[Mock]]:
+        """Page whose #register_button is enabled and whose register API responses
+        come back with the given statuses, in order."""
+        button = Mock()
+        button.wait_for = AsyncMock()
+        button.is_enabled = AsyncMock(return_value=True)
+        button.click = AsyncMock()
+
+        responses = []
+        for status in response_statuses:
+            resp = Mock()
+            resp.status = status
+            resp.url = "https://login.nvgs.nvidia.com/api/1/frontend/oauth/user/register"
+            resp.request.method = "POST"
+            resp.text = AsyncMock(return_value="{}")
+            responses.append(resp)
+
+        page = Mock()
+        page.locator.return_value = button
+        page.wait_for_event = AsyncMock(side_effect=responses)
+        page.evaluate = AsyncMock(return_value=True)
+        return page, button, responses
+
+    async def test_register_response_accepted(self) -> None:
+        page, _, _ = self._register_page([200])
+        result = await _wait_for_register_response(page)
+        self.assertEqual(result, "accepted")
+
+    async def test_register_response_email_exists(self) -> None:
+        page, _, responses = self._register_page([409])
+        responses[0].text = AsyncMock(return_value='{"error": "CONFLICT"}')
+        result = await _wait_for_register_response(page)
+        self.assertEqual(result, "email_exists")
+
+    async def test_register_response_rejected(self) -> None:
+        page, _, _ = self._register_page([500])
+        result = await _wait_for_register_response(page)
+        self.assertEqual(result, "rejected")
+
+    async def test_click_register_and_wait_result(self) -> None:
+        page, button, _ = self._register_page([200])
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            result = await _click_register_and_wait_result(page)
+        self.assertEqual(result, "accepted")
+        button.click.assert_awaited_once()
+
+    async def test_solve_captcha_and_submit_retries_on_rejection(self) -> None:
+        page, _, _ = self._register_page([500, 200])
+        solver = Mock()
+        solver.solve = AsyncMock(return_value=True)
+        config = _app_config("llm")
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            ok = await _solve_captcha_and_submit(page, solver, config)
+
+        self.assertTrue(ok)
+        self.assertEqual(solver.solve.await_count, 2)
+        # 第二次尝试前重置了 hCaptcha 组件
+        self.assertEqual(page.evaluate.await_count, 1)
+
+    async def test_solve_captcha_and_submit_gives_up_after_attempts(self) -> None:
+        page, _, _ = self._register_page([500, 500, 500])
+        solver = Mock()
+        solver.solve = AsyncMock(return_value=True)
+        config = _app_config("llm")
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            ok = await _solve_captcha_and_submit(page, solver, config)
+
+        self.assertFalse(ok)
+        self.assertEqual(solver.solve.await_count, 3)
+
+    async def test_request_new_verification_code_clicks_resend_link(self) -> None:
+        link = Mock()
+        link.count = AsyncMock(return_value=1)
+        link.click = AsyncMock()
+        link.filter = Mock(return_value=link)
+        link.first = link
+
+        page = Mock()
+        page.get_by_text.return_value = link
+
+        with patch("main.asyncio.sleep", new=AsyncMock()):
+            clicked = await _request_new_verification_code(page)
+
+        self.assertTrue(clicked)
+        link.click.assert_awaited_once()
+
+    async def test_recover_from_navigation_error_reloads(self) -> None:
+        page = Mock(url="https://build.nvidia.com/")
+        page.reload = AsyncMock()
+        page.goto = AsyncMock()
+
+        recovered = await _recover_from_navigation_error(page)
+
+        self.assertTrue(recovered)
+        page.reload.assert_awaited_once()
+        page.goto.assert_not_awaited()
+
+    async def test_recover_from_navigation_error_falls_back_to_goto(self) -> None:
+        page = Mock(url="chrome-error://chromewebdata/")
+        page.reload = AsyncMock(side_effect=Exception("boom"))
+
+        async def fake_goto(*_args, **_kwargs) -> None:
+            page.url = "https://build.nvidia.com/"
+
+        page.goto = AsyncMock(side_effect=fake_goto)
+
+        recovered = await _recover_from_navigation_error(page)
+
+        self.assertTrue(recovered)
+        page.goto.assert_awaited_once()
 
 
 def _app_config(captcha_mode: str, concurrency: int = 1) -> AppConfig:
